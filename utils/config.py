@@ -20,7 +20,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass
@@ -36,8 +36,12 @@ class ExpConfig:
     max_critic_rounds: int = 3
     model_name: str = ""
     image_model_name: str = ""
-    provider: str = "evolink"
+    provider: str = "openai_compatible"
+    text_provider: str = "openai_compatible"
+    image_provider: str = "openai_compatible"
     work_dir: Path = Path(__file__).parent.parent
+    text_runtime_clients: Any = None
+    image_runtime_clients: Any = None
 
     timestamp: str | None = None
 
