@@ -50,7 +50,7 @@ class PlannerAgent(BaseAgent):
 
     async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
         cfg = self.task_config
-        print(f"[DEBUG] [PlannerAgent] 开始处理, task={cfg['task_name']}, provider={self.exp_config.provider}, model={self.model_name}")
+        print(f"[DEBUG] [PlannerAgent] 开始处理, task={cfg['task_name']}, provider={self.exp_config.text_provider}, model={self.model_name}")
 
         raw_content = data["content"]
         content = json.dumps(raw_content) if isinstance(raw_content, (dict, list)) else raw_content
@@ -97,17 +97,24 @@ class PlannerAgent(BaseAgent):
         print(f"[DEBUG] [PlannerAgent] content_list 长度={len(content_list)}, 示例数={len(examples)}")
 
         # 根据 provider 路由 API 调用
-        if self.exp_config.provider == "evolink":
+        max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+            model_name=self.model_name,
+            provider=self.exp_config.text_provider,
+            runtime_clients=self.exp_config.text_runtime_clients,
+            fallback=50000,
+        )
+        if self.exp_config.text_provider == "openai_compatible":
             response_list = await generation_utils.call_evolink_text_with_retry_async(
                 model_name=self.model_name,
                 contents=content_list,
                 config={
                     "system_prompt": self.system_prompt,
                     "temperature": self.exp_config.temperature,
-                    "max_output_tokens": 50000,
+                    "max_output_tokens": max_output_tokens,
                 },
                 max_attempts=5,
                 retry_delay=5,
+                runtime_clients=self.exp_config.text_runtime_clients,
             )
         else:
             from google.genai import types
@@ -118,10 +125,11 @@ class PlannerAgent(BaseAgent):
                     system_instruction=self.system_prompt,
                     temperature=self.exp_config.temperature,
                     candidate_count=1,
-                    max_output_tokens=50000,
+                    max_output_tokens=max_output_tokens,
                 ),
                 max_attempts=5,
                 retry_delay=5,
+                runtime_clients=self.exp_config.text_runtime_clients,
             )
 
         for idx, response in enumerate(response_list):

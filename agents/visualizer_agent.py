@@ -91,10 +91,11 @@ class VisualizerAgent(BaseAgent):
         if self.process_executor:
             self.process_executor.shutdown(wait=True)
 
-    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def process(self, data: Dict[str, Any], progress_callback=None) -> Dict[str, Any]:
         cfg = self.task_config
         task_name = cfg["task_name"]
-        print(f"[DEBUG] [VisualizerAgent] 开始处理, task={task_name}, provider={self.exp_config.provider}, model={self.model_name}, 图像生成={cfg['use_image_generation']}")
+        active_provider = self.exp_config.image_provider if cfg["use_image_generation"] else self.exp_config.text_provider
+        print(f"[DEBUG] [VisualizerAgent] 开始处理, task={task_name}, provider={active_provider}, model={self.model_name}, 图像生成={cfg['use_image_generation']}")
 
         desc_keys_to_process = []
         for key in [
@@ -128,9 +129,37 @@ class VisualizerAgent(BaseAgent):
             prompt_text = cfg["prompt_template"].format(desc=data[desc_key])
             content_list = [{"type": "text", "text": prompt_text}]
             print(f"[DEBUG] [VisualizerAgent] 处理 {desc_key}, prompt 长度={len(prompt_text)}")
+            candidate_id = data.get("candidate_id", "N/A")
+
+            async def emit_image_progress(message: str):
+                if progress_callback is None:
+                    return
+                event = {
+                    "type": "candidate_progress",
+                    "candidate_id": candidate_id,
+                    "stage": "visualizer",
+                    "status": "running",
+                    "message": message,
+                }
+                result = progress_callback(event)
+                if asyncio.iscoroutine(result):
+                    await result
 
             # 根据 provider 路由 API 调用
-            if self.exp_config.provider == "evolink":
+            if cfg["use_image_generation"]:
+                provider_name = self.exp_config.image_provider
+                runtime_clients = self.exp_config.image_runtime_clients
+            else:
+                provider_name = self.exp_config.text_provider
+                runtime_clients = self.exp_config.text_runtime_clients
+            resolved_max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+                model_name=self.exp_config.model_name if not cfg["use_image_generation"] else self.model_name,
+                provider=provider_name,
+                runtime_clients=runtime_clients,
+                fallback=cfg["max_output_tokens"],
+            )
+
+            if provider_name == "openai_compatible":
                 if cfg["use_image_generation"]:
                     # Evolink 图像生成（异步任务模式）
                     aspect_ratio = "1:1"
@@ -146,6 +175,8 @@ class VisualizerAgent(BaseAgent):
                         },
                         max_attempts=5,
                         retry_delay=30,
+                        runtime_clients=runtime_clients,
+                        progress_callback=emit_image_progress,
                     )
                 else:
                     # Evolink 文本生成（用于代码生成）
@@ -155,18 +186,19 @@ class VisualizerAgent(BaseAgent):
                         config={
                             "system_prompt": self.system_prompt,
                             "temperature": self.exp_config.temperature,
-                            "max_output_tokens": cfg["max_output_tokens"],
+                            "max_output_tokens": resolved_max_output_tokens,
                         },
                         max_attempts=5,
                         retry_delay=30,
+                        runtime_clients=runtime_clients,
                     )
-            elif "gemini" in self.model_name:
+            elif provider_name == "google_compatible":
                 from google.genai import types
                 gen_config_args = {
                     "system_instruction": self.system_prompt,
                     "temperature": self.exp_config.temperature,
                     "candidate_count": 1,
-                    "max_output_tokens": cfg["max_output_tokens"],
+                    "max_output_tokens": resolved_max_output_tokens,
                 }
                 if cfg["use_image_generation"]:
                     aspect_ratio = "1:1"
@@ -183,6 +215,7 @@ class VisualizerAgent(BaseAgent):
                     config=types.GenerateContentConfig(**gen_config_args),
                     max_attempts=5,
                     retry_delay=30,
+                    runtime_clients=runtime_clients,
                 )
             elif "gpt-image" in self.model_name:
                 image_config = {
@@ -197,6 +230,7 @@ class VisualizerAgent(BaseAgent):
                     config=image_config,
                     max_attempts=5,
                     retry_delay=30,
+                    runtime_clients=runtime_clients,
                 )
             else:
                 raise ValueError(f"Unsupported model: {self.model_name}")
@@ -206,6 +240,12 @@ class VisualizerAgent(BaseAgent):
                 continue
 
             print(f"[DEBUG] [VisualizerAgent] {desc_key}: API 响应长度={len(response_list[0])}, 值前20字={response_list[0][:20]}...")
+
+            if response_list[0] == "QuotaExceeded":
+                data["image_generation_blocked"] = "quota_exhausted"
+                data["image_generation_blocked_model"] = self.model_name
+                print(f"[DEBUG] [VisualizerAgent] ⛔ {desc_key}: 模型 {self.model_name} 当日额度已耗尽，停止当前候选的后续出图")
+                break
 
             # Post-process based on task type
             if cfg["use_image_generation"]:

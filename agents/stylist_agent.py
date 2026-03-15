@@ -69,17 +69,24 @@ class StylistAgent(BaseAgent):
         content_list = [{"type": "text", "text": user_prompt}]
 
         # 根据 provider 路由 API 调用
-        if self.exp_config.provider == "evolink":
+        max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+            model_name=self.model_name,
+            provider=self.exp_config.text_provider,
+            runtime_clients=self.exp_config.text_runtime_clients,
+            fallback=50000,
+        )
+        if self.exp_config.text_provider == "openai_compatible":
             response_list = await generation_utils.call_evolink_text_with_retry_async(
                 model_name=self.model_name,
                 contents=content_list,
                 config={
                     "system_prompt": self.system_prompt,
                     "temperature": self.exp_config.temperature,
-                    "max_output_tokens": 50000,
+                    "max_output_tokens": max_output_tokens,
                 },
                 max_attempts=5,
                 retry_delay=5,
+                runtime_clients=self.exp_config.text_runtime_clients,
             )
         else:
             from google.genai import types
@@ -90,10 +97,11 @@ class StylistAgent(BaseAgent):
                     system_instruction=self.system_prompt,
                     temperature=self.exp_config.temperature,
                     candidate_count=1,
-                    max_output_tokens=50000,
+                    max_output_tokens=max_output_tokens,
                 ),
                 max_attempts=5,
                 retry_delay=5,
+                runtime_clients=self.exp_config.text_runtime_clients,
             )
 
         data[output_desc_key] = response_list[0]
