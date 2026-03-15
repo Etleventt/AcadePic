@@ -1,11 +1,13 @@
 """
-Evolink API Provider
+OpenAI-compatible API Provider
 支持文本生成（OpenAI 兼容接口）和图像生成（异步任务接口）
 """
 
 import asyncio
 import base64
-from typing import List, Dict, Any, Optional
+import json
+import re
+from typing import List, Dict, Any, Optional, Callable
 
 import aiohttp
 
@@ -17,9 +19,9 @@ class ClientError(Exception):
     pass
 
 
-class EvolinkProvider(BaseProvider):
+class OpenAICompatibleProvider(BaseProvider):
     """
-    Evolink API Provider
+    OpenAI-compatible API Provider
 
     文本模型: 通过 /v1/chat/completions (OpenAI 兼容)
     图像模型: 通过 /v1/images/generations (异步任务) + /v1/tasks/{id} (轮询)
@@ -29,9 +31,11 @@ class EvolinkProvider(BaseProvider):
         self,
         api_key: str,
         base_url: str = "https://api.evolink.ai",
+        file_base_url: str = "",
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.file_base_url = file_base_url.rstrip("/") if file_base_url else ""
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -174,8 +178,22 @@ class EvolinkProvider(BaseProvider):
             timeout=aiohttp.ClientTimeout(total=120),
         ) as resp:
             status = resp.status
-            body = await resp.json()
-            print(f"[DEBUG] [Evolink]   响应 status={status}, keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
+            content_type = resp.headers.get("Content-Type", "").lower()
+            raw_text = await resp.text()
+            if "json" in content_type:
+                try:
+                    body = json.loads(raw_text)
+                except Exception:
+                    body = raw_text
+            else:
+                body = raw_text
+
+            if isinstance(body, dict):
+                body_summary = f"keys={list(body.keys())}"
+            else:
+                preview = str(body)[:160].replace("\n", " ")
+                body_summary = f"content_type={content_type or 'unknown'}, body_preview={preview}"
+            print(f"[DEBUG] [Evolink]   响应 status={status}, {body_summary}")
             if status >= 400:
                 error_msg = body.get("error", body) if isinstance(body, dict) else body
                 print(f"[DEBUG] [Evolink]   ❌ 错误详情: {error_msg}")
@@ -183,6 +201,8 @@ class EvolinkProvider(BaseProvider):
                 if 400 <= status < 500 and status != 429:
                     raise ClientError(f"HTTP {status}: {error_msg}")
             resp.raise_for_status()
+            if not isinstance(body, dict):
+                raise RuntimeError(f"HTTP {status}: expected JSON response but got {content_type or 'unknown'}")
             return body
 
     async def _get_json(self, url: str) -> Dict[str, Any]:
@@ -194,10 +214,20 @@ class EvolinkProvider(BaseProvider):
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             status = resp.status
-            body = await resp.json()
+            content_type = resp.headers.get("Content-Type", "").lower()
+            raw_text = await resp.text()
+            if "json" in content_type:
+                try:
+                    body = json.loads(raw_text)
+                except Exception:
+                    body = raw_text
+            else:
+                body = raw_text
             if status >= 400:
                 print(f"[DEBUG] [Evolink] GET {url} ❌ status={status}, body={body}")
             resp.raise_for_status()
+            if not isinstance(body, dict):
+                raise RuntimeError(f"HTTP {status}: expected JSON response but got {content_type or 'unknown'}")
             return body
 
     async def _download_image_as_base64(self, url: str) -> Optional[str]:
@@ -211,6 +241,300 @@ class EvolinkProvider(BaseProvider):
         except Exception as e:
             print(f"下载图片失败 ({url}): {e}")
             return None
+
+    async def _emit_progress(self, progress_callback: Optional[Callable[[str], Any]], message: str):
+        if progress_callback is None:
+            return
+        result = progress_callback(message)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _iter_sse_events(self, resp):
+        """Yield full SSE data payloads instead of raw transport chunks."""
+        data_lines = []
+        while True:
+            line_bytes = await resp.content.readline()
+            if not line_bytes:
+                if data_lines:
+                    yield "\n".join(data_lines)
+                break
+
+            line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if data_lines:
+                    yield "\n".join(data_lines)
+                    data_lines = []
+                continue
+
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+
+    def _extract_text_delta(self, delta: Any) -> str:
+        if isinstance(delta, str):
+            return delta
+        if isinstance(delta, list):
+            parts = []
+            for item in delta:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts)
+        return ""
+
+    def _extract_image_reference(self, value: Any) -> Optional[str]:
+        """Extract a usable image reference (URL or base64/data URL) from nested values."""
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            if candidate.startswith("http://") or candidate.startswith("https://"):
+                return candidate
+            if candidate.startswith("data:image/"):
+                return candidate
+            if re.fullmatch(r"[A-Za-z0-9+/=]{256,}", candidate):
+                return candidate
+            md_match = re.search(r"!\[[^\]]*\]\((https?://[^)]+)\)", candidate)
+            if md_match:
+                return md_match.group(1)
+            return None
+
+        if isinstance(value, dict):
+            for key in ("image", "image_url", "url", "b64_json", "data"):
+                if key in value:
+                    extracted = self._extract_image_reference(value[key])
+                    if extracted:
+                        return extracted
+            for nested in value.values():
+                extracted = self._extract_image_reference(nested)
+                if extracted:
+                    return extracted
+            return None
+
+        if isinstance(value, list):
+            for item in value:
+                extracted = self._extract_image_reference(item)
+                if extracted:
+                    return extracted
+
+        return None
+
+    async def _materialize_image_reference(self, ref: str) -> Optional[str]:
+        """Turn a URL/data URL/raw base64 into a plain base64 image payload."""
+        if not ref:
+            return None
+        if ref.startswith("http://") or ref.startswith("https://"):
+            return await self._download_image_as_base64(ref)
+        if ref.startswith("data:image/") and "," in ref:
+            return ref.split(",", 1)[1]
+        return ref
+
+    async def _generate_image_via_chat_completions_stream(
+        self,
+        model_name: str,
+        prompt: str,
+        image_urls: Optional[List[str]] = None,
+        max_attempts: int = 3,
+        retry_delay: float = 30,
+        error_context: str = "",
+        progress_callback: Optional[Callable[[str], Any]] = None,
+    ) -> List[str]:
+        """Fallback image generation path for providers exposing image models via streamed chat completions."""
+        url = f"{self.base_url}/v1/chat/completions"
+        content = [{"type": "text", "text": prompt}]
+        for image_url in image_urls or []:
+            content.append({"type": "image_url", "image_url": {"url": image_url}})
+
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": content}],
+            "stream": True,
+            "temperature": 1,
+            "max_tokens": 1024,
+        }
+        if image_urls:
+            payload["image"] = image_urls[0]
+
+        for attempt in range(max_attempts):
+            try:
+                print(f"[OpenAI-compatible 图像] 回退到 /v1/chat/completions 流式生成")
+                session = await self._get_session()
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=self._get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=600),
+                ) as resp:
+                    resp.raise_for_status()
+                    if "text/event-stream" not in resp.headers.get("Content-Type", "").lower():
+                        text = await resp.text()
+                        raise RuntimeError(f"Unexpected non-stream response: {text[:200]}")
+
+                    async for data_str in self._iter_sse_events(resp):
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            payload_obj = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if isinstance(payload_obj, dict) and "error" in payload_obj:
+                            raise RuntimeError(payload_obj["error"].get("message", payload_obj["error"]))
+
+                        delta = None
+                        if isinstance(payload_obj, dict):
+                            choices = payload_obj.get("choices", [])
+                            if choices and isinstance(choices, list):
+                                delta = choices[0].get("delta", {})
+                        if isinstance(delta, dict):
+                            progress_text = delta.get("reasoning_content")
+                            if progress_text:
+                                await self._emit_progress(progress_callback, progress_text.strip())
+
+                        ref = self._extract_image_reference(payload_obj)
+                        if ref:
+                            print(f"[OpenAI-compatible 图像] 捕获到图片引用: {ref[:120]}...")
+                            b64_image = await self._materialize_image_reference(ref)
+                            if b64_image:
+                                print(f"[OpenAI-compatible 图像] 成功获取图片数据，长度={len(b64_image)}")
+                                return [b64_image]
+
+                print("[OpenAI-compatible 图像] 流式返回中未找到图片数据")
+
+            except ClientError as e:
+                context_msg = f" ({error_context})" if error_context else ""
+                print(f"[OpenAI-compatible 图像] ❌ 客户端错误{context_msg}: {e}。不再重试。")
+                return ["Error"]
+            except Exception as e:
+                context_msg = f" ({error_context})" if error_context else ""
+                current_delay = min(retry_delay * (2 ** attempt), 60)
+                print(f"[OpenAI-compatible 图像] 第 {attempt + 1} 次流式尝试失败{context_msg}: {e}。{current_delay}s 后重试...")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(current_delay)
+                else:
+                    print(f"[OpenAI-compatible 图像] 全部 {max_attempts} 次流式尝试失败{context_msg}")
+
+        return ["Error"]
+
+    async def _generate_text_stream(
+        self,
+        model_name: str,
+        contents: List[Dict[str, Any]],
+        system_prompt: str = "",
+        temperature: float = 1.0,
+        max_output_tokens: int = 12000,
+        max_attempts: int = 3,
+        retry_delay: float = 3,
+        error_context: str = "",
+        progress_callback: Optional[Callable[[Any], Any]] = None,
+    ) -> List[str]:
+        """Generate text via streamed chat completions and emit partial deltas."""
+        url = f"{self.base_url}/v1/chat/completions"
+        payload = self._build_text_payload(
+            model_name=model_name,
+            contents=contents,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        payload["stream"] = True
+
+        content_types = [item.get("type", "?") for item in contents]
+        sys_len = len(system_prompt) if system_prompt else 0
+        print(f"[DEBUG] [Evolink 文本流] 请求: model={model_name}, temp={temperature}, max_tokens={max_output_tokens}")
+        print(f"[DEBUG] [Evolink 文本流]   内容: {content_types}, system_prompt 长度={sys_len}")
+
+        for attempt in range(max_attempts):
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=self._get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=600),
+                ) as resp:
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("Content-Type", "").lower()
+
+                    if "text/event-stream" not in content_type:
+                        text = await resp.text()
+                        try:
+                            body = json.loads(text)
+                            choices = body.get("choices", [])
+                            if choices:
+                                final_text = choices[0].get("message", {}).get("content", "")
+                                if final_text:
+                                    await self._emit_progress(progress_callback, {"text": final_text, "delta": final_text})
+                                    return [final_text]
+                        except Exception:
+                            pass
+                        raise RuntimeError(f"Unexpected non-stream response: {text[:200]}")
+
+                    full_text_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+
+                    async for data_str in self._iter_sse_events(resp):
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            payload_obj = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if isinstance(payload_obj, dict) and "error" in payload_obj:
+                            raise RuntimeError(payload_obj["error"].get("message", payload_obj["error"]))
+
+                        choices = payload_obj.get("choices", []) if isinstance(payload_obj, dict) else []
+                        if not choices or not isinstance(choices, list):
+                            continue
+                        delta = choices[0].get("delta", {})
+                        if not isinstance(delta, dict):
+                            continue
+
+                        reasoning_delta = delta.get("reasoning_content")
+                        if isinstance(reasoning_delta, str) and reasoning_delta:
+                            reasoning_parts.append(reasoning_delta)
+
+                        text_delta = self._extract_text_delta(delta.get("content"))
+                        if text_delta:
+                            full_text_parts.append(text_delta)
+                            await self._emit_progress(
+                                progress_callback,
+                                {
+                                    "delta": text_delta,
+                                    "text": "".join(full_text_parts),
+                                    "reasoning": "".join(reasoning_parts),
+                                },
+                            )
+
+                    final_text = "".join(full_text_parts).strip()
+                    if final_text:
+                        print(f"[DEBUG] [Evolink 文本流] ✓ 成功, 响应长度={len(final_text)}")
+                        return [final_text]
+
+                    print(f"[Evolink 文本流] 响应为空，{retry_delay}s 后重试...")
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(retry_delay)
+
+            except ClientError as e:
+                context_msg = f" ({error_context})" if error_context else ""
+                print(f"[Evolink 文本流] ❌ 客户端错误{context_msg}: {e}。不再重试。")
+                return ["Error"]
+            except Exception as e:
+                context_msg = f" ({error_context})" if error_context else ""
+                current_delay = min(retry_delay * (2 ** attempt), 30)
+                print(
+                    f"[Evolink 文本流] 第 {attempt + 1} 次尝试失败{context_msg}: {e}。"
+                    f"{current_delay}s 后重试..."
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(current_delay)
+                else:
+                    print(f"[Evolink 文本流] 全部 {max_attempts} 次尝试失败{context_msg}")
+
+        return ["Error"]
 
     # ==================== 文件上传 ====================
 
@@ -227,7 +551,11 @@ class EvolinkProvider(BaseProvider):
         Returns:
             上传成功返回 file_url，失败返回 None
         """
-        upload_url = "https://files-api.evolink.ai/api/v1/files/upload/base64"
+        if not self.file_base_url:
+            print("[OpenAI-compatible 上传] ❌ 未配置 file_base_url，无法上传参考图。")
+            return None
+
+        upload_url = f"{self.file_base_url}/api/v1/files/upload/base64"
         data_url = f"data:{media_type};base64,{image_b64}"
 
         try:
@@ -263,12 +591,26 @@ class EvolinkProvider(BaseProvider):
         max_attempts: int = 3,
         retry_delay: float = 5,
         error_context: str = "",
+        progress_callback: Optional[Callable[[Any], Any]] = None,
     ) -> List[str]:
         """
         通过 /v1/chat/completions 生成文本
 
         兼容 OpenAI Chat Completions API 格式
         """
+        if progress_callback is not None:
+            return await self._generate_text_stream(
+                model_name=model_name,
+                contents=contents,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                max_attempts=max_attempts,
+                retry_delay=retry_delay,
+                error_context=error_context,
+                progress_callback=progress_callback,
+            )
+
         url = f"{self.base_url}/v1/chat/completions"
         payload = self._build_text_payload(
             model_name=model_name,
@@ -335,14 +677,39 @@ class EvolinkProvider(BaseProvider):
         poll_interval: float = 3,
         max_polls: int = 60,
         error_context: str = "",
+        progress_callback: Optional[Callable[[str], Any]] = None,
     ) -> List[str]:
         """
-        通过 /v1/images/generations 异步生成图像
+        生成图像。
 
-        流程：
-        1. POST 创建任务，获取 task_id
-        2. GET 轮询任务状态直到完成
-        3. 下载图片 URL 并转换为 base64
+        对 OpenAI-compatible 图像站点，优先走 /v1/chat/completions 的流式生成。
+        旧的 /v1/images/generations 任务式接口仅保留为兼容代码，不再默认尝试。
+        """
+        return await self._generate_image_via_chat_completions_stream(
+            model_name=model_name,
+            prompt=prompt,
+            image_urls=image_urls,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            error_context=error_context,
+            progress_callback=progress_callback,
+        )
+
+    async def _generate_image_via_legacy_task_api(
+        self,
+        model_name: str,
+        prompt: str,
+        aspect_ratio: str = "16:9",
+        quality: str = "2K",
+        image_urls: Optional[List[str]] = None,
+        max_attempts: int = 3,
+        retry_delay: float = 30,
+        poll_interval: float = 3,
+        max_polls: int = 60,
+        error_context: str = "",
+    ) -> List[str]:
+        """
+        通过 /v1/images/generations 异步生成图像（保留兼容代码，不作为默认路径）。
         """
         create_url = f"{self.base_url}/v1/images/generations"
         print(f"[DEBUG] [Evolink 图像] 请求: model={model_name}, ratio={aspect_ratio}, quality={quality}")
@@ -431,3 +798,6 @@ class EvolinkProvider(BaseProvider):
                     print(f"[Evolink 图像] 全部 {max_attempts} 次尝试失败{context_msg}")
 
         return ["Error"]
+
+
+EvolinkProvider = OpenAICompatibleProvider
