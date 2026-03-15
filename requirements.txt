@@ -13,3 +13,5 @@ matplotlib
 python-dotenv
 pyyaml
 google-auth
+fastapi
+uvicorn

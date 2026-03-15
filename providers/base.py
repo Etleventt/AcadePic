@@ -4,7 +4,7 @@ Provider 抽象基类
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 
 
 class BaseProvider(ABC):
@@ -21,6 +21,7 @@ class BaseProvider(ABC):
         max_attempts: int = 5,
         retry_delay: float = 5,
         error_context: str = "",
+        progress_callback: Optional[Callable[[Any], Any]] = None,
     ) -> List[str]:
         """
         文本生成接口
@@ -34,6 +35,7 @@ class BaseProvider(ABC):
             max_attempts: 最大重试次数
             retry_delay: 重试间隔（秒）
             error_context: 错误上下文信息
+            progress_callback: 流式文本进度回调
 
         Returns:
             响应文本列表
@@ -52,6 +54,7 @@ class BaseProvider(ABC):
         retry_delay: float = 30,
         poll_interval: float = 3,
         error_context: str = "",
+        progress_callback: Optional[Callable[[str], Any]] = None,
     ) -> List[str]:
         """
         图像生成接口
