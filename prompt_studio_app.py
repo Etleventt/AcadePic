@@ -581,7 +581,7 @@ def load_default_config() -> dict[str, Any]:
         "google_text_api_key": google_cfg.get("text_api_key") or api_keys_cfg.get("google_api_key", ""),
         "google_image_api_key": google_cfg.get("image_api_key") or api_keys_cfg.get("google_api_key", ""),
         "google_base_url": google_cfg.get("base_url", ""),
-        "paper_file_path": ui_cfg.get("paper_file_path", str(APP_ROOT / "mypaper" / "content.tex")),
+        "paper_file_path": ui_cfg.get("paper_file_path", ""),
     }
 
 
