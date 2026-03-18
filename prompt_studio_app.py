@@ -22,7 +22,7 @@ import json_repair
 from agents.critic_agent import CriticAgent
 from agents.planner_agent import PlannerAgent
 from agents.stylist_agent import StylistAgent
-from agents.visualizer_agent import VisualizerAgent
+from agents.visualizer_agent import VisualizerAgent, _execute_plot_code_worker
 from utils import generation_utils
 from utils.config import ExpConfig
 from utils.image_utils import base64_to_image, save_base64_image_as_png
@@ -36,6 +36,37 @@ ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
 LEGACY_DEMO_ROOT = APP_ROOT / "results" / "demo"
 ARCHIVE_MANIFEST_PATH = APP_ROOT / "prompt_studio_history" / ".archive_manifest.json"
 
+TASK_META = {
+    "diagram": {
+        "content_label": "Methodology Section",
+        "content_heading": "方法内容",
+        "content_placeholder": "方法内容 / 某一章某一节",
+        "intent_label": "Diagram Caption",
+        "intent_heading": "图题 / 图注",
+        "intent_placeholder": "图题 / 图注",
+        "tree_action_label": "用作方法内容",
+        "style_guide": "neurips2025_diagram_style_guide.md",
+        "critic_target": "Target Diagram for Critique:",
+        "critic_context_labels": ("Methodology Section", "Figure Caption"),
+        "desc_output_suffix": " (do not include figure titles):",
+        "generated_code_label": "生成代码",
+    },
+    "plot": {
+        "content_label": "Plot Raw Data",
+        "content_heading": "原始数据",
+        "content_placeholder": "原始数据 / 表格 / JSON / CSV",
+        "intent_label": "Visual Intent of the Desired Plot",
+        "intent_heading": "作图意图",
+        "intent_placeholder": "例如：比较不同方法的 PSNR/SSIM 柱状图",
+        "tree_action_label": "用作原始数据",
+        "style_guide": "neurips2025_plot_style_guide.md",
+        "critic_target": "Target Plot for Critique:",
+        "critic_context_labels": ("Raw Data", "Visual Intent"),
+        "desc_output_suffix": ":",
+        "generated_code_label": "Matplotlib 代码",
+    },
+}
+
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 APP_SHUTTING_DOWN = False
@@ -46,6 +77,76 @@ ARCHIVE_LOCK = threading.Lock()
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_task_meta(task_type: str) -> dict[str, Any]:
+    return TASK_META.get(task_type, TASK_META["diagram"])
+
+
+def target_desc_key(task_type: str) -> str:
+    return f"target_{task_type}_desc0"
+
+
+def target_stylist_key(task_type: str) -> str:
+    return f"target_{task_type}_stylist_desc0"
+
+
+def target_desc_image_key(task_type: str) -> str:
+    return f"{target_desc_key(task_type)}_base64_jpg"
+
+
+def target_stylist_image_key(task_type: str) -> str:
+    return f"{target_stylist_key(task_type)}_base64_jpg"
+
+
+def critic_suggestions_key(task_type: str, round_idx: int) -> str:
+    return f"target_{task_type}_critic_suggestions{round_idx}"
+
+
+def critic_desc_key(task_type: str, round_idx: int) -> str:
+    return f"target_{task_type}_critic_desc{round_idx}"
+
+
+def critic_desc_image_key(task_type: str, round_idx: int) -> str:
+    return f"{critic_desc_key(task_type, round_idx)}_base64_jpg"
+
+
+def generated_code_key(task_type: str, base_key: str) -> str:
+    return f"{base_key}_code" if task_type == "plot" else ""
+
+
+def select_candidate_image_key(result: dict[str, Any], task_type: str) -> str | None:
+    for round_idx in range(3, -1, -1):
+        key = critic_desc_image_key(task_type, round_idx)
+        if result.get(key):
+            return key
+    for key in (target_stylist_image_key(task_type), target_desc_image_key(task_type)):
+        if result.get(key):
+            return key
+    return None
+
+
+def select_candidate_code(result: dict[str, Any], task_type: str) -> str:
+    if task_type != "plot":
+        return ""
+    for round_idx in range(3, -1, -1):
+        key = generated_code_key(task_type, critic_desc_key(task_type, round_idx))
+        if result.get(key):
+            return result.get(key, "")
+    for key in (
+        generated_code_key(task_type, target_stylist_key(task_type)),
+        generated_code_key(task_type, target_desc_key(task_type)),
+    ):
+        if result.get(key):
+            return result.get(key, "")
+    return ""
+
+
+def infer_task_type_from_result_item(item: dict[str, Any]) -> str:
+    for key in item.keys():
+        if key.startswith("target_plot_"):
+            return "plot"
+    return "diagram"
 
 
 def parse_latex_sections(tex_content: str) -> list[dict[str, Any]]:
@@ -232,6 +333,7 @@ def list_records() -> list[dict[str, Any]]:
                 {
                     "id": record_id,
                     "title": data.get("title", ""),
+                    "task_type": data.get("task_type", "diagram"),
                     "created_at": data.get("created_at", ""),
                     "updated_at": data.get("updated_at", ""),
                     "candidate_count": len(data.get("candidates", [])),
@@ -261,6 +363,7 @@ def list_records() -> list[dict[str, Any]]:
                 {
                     "id": legacy_id,
                     "title": path.stem,
+                    "task_type": infer_task_type_from_result_item(first) if first else "diagram",
                     "created_at": timestamp,
                     "updated_at": timestamp,
                     "candidate_count": candidate_count,
@@ -298,16 +401,18 @@ def legacy_demo_path_from_record_id(record_id: str) -> Path | None:
 
 
 def choose_legacy_image_base64(item: dict[str, Any]) -> str:
+    task_type = infer_task_type_from_result_item(item)
     eval_field = item.get("eval_image_field")
     if isinstance(eval_field, str) and item.get(eval_field):
         return item.get(eval_field, "")
-    for key in (
-        "target_diagram_critic_desc2_base64_jpg",
-        "target_diagram_critic_desc1_base64_jpg",
-        "target_diagram_critic_desc0_base64_jpg",
-        "target_diagram_stylist_desc0_base64_jpg",
-        "target_diagram_desc0_base64_jpg",
-    ):
+    keys = [
+        critic_desc_image_key(task_type, round_idx)
+        for round_idx in range(2, -1, -1)
+    ] + [
+        target_stylist_image_key(task_type),
+        target_desc_image_key(task_type),
+    ]
+    for key in keys:
         value = item.get(key)
         if isinstance(value, str) and len(value) > 100:
             return value
@@ -324,6 +429,9 @@ def materialize_legacy_demo_record(path: Path) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     critic_runs: list[dict[str, Any]] = []
     first = loaded[0] if loaded else {}
+
+    task_type = infer_task_type_from_result_item(first) if first else "diagram"
+    meta = get_task_meta(task_type)
 
     for idx, item in enumerate(loaded):
         candidate_id = item.get("candidate_id", idx)
@@ -346,12 +454,13 @@ def materialize_legacy_demo_record(path: Path) -> dict[str, Any]:
         latest_suggestion = ""
         latest_revision = ""
         for round_idx in range(3, -1, -1):
-            suggestion_key = f"target_diagram_critic_suggestions{round_idx}"
-            revision_key = f"target_diagram_critic_desc{round_idx}"
+            suggestion_key = critic_suggestions_key(task_type, round_idx)
+            revision_key = critic_desc_key(task_type, round_idx)
             if item.get(suggestion_key) or item.get(revision_key):
                 latest_suggestion = item.get(suggestion_key, "")
                 latest_revision = item.get(revision_key, "")
                 break
+        candidate_code = select_candidate_code(item, task_type)
         if latest_suggestion or latest_revision:
             critic_data = {
                 "candidate_id": candidate_id,
@@ -377,6 +486,7 @@ def materialize_legacy_demo_record(path: Path) -> dict[str, Any]:
                 "image_path": imported_image_path.name if candidate_image else "",
                 "image_url": candidate_image,
                 "critic": critic_data,
+                "generated_code": candidate_code,
             }
         )
 
@@ -384,15 +494,16 @@ def materialize_legacy_demo_record(path: Path) -> dict[str, Any]:
     record = {
         "id": imported_id,
         "source": "legacy_demo",
+        "task_type": task_type,
         "created_at": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
         "updated_at": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
         "title": title,
         "caption": first.get("caption", "") or first.get("visual_intent", ""),
         "method_text": first.get("content", ""),
-        "planner_user_prompt": planner_user_prompt(first.get("content", ""), first.get("caption", "") or first.get("visual_intent", "")),
-        "planner_output": first.get("target_diagram_desc0", ""),
+        "planner_user_prompt": planner_user_prompt(first.get("content", ""), first.get("caption", "") or first.get("visual_intent", ""), task_type),
+        "planner_output": first.get(target_desc_key(task_type), ""),
         "stylist_user_prompt": "",
-        "stylist_output": first.get("target_diagram_stylist_desc0", "") or first.get("target_diagram_desc0", ""),
+        "stylist_output": first.get(target_stylist_key(task_type), "") or first.get(target_desc_key(task_type), ""),
         "candidates": candidates,
         "critic_runs": critic_runs,
         "config": {"legacy_demo_json": str(path)},
@@ -458,6 +569,7 @@ def load_default_config() -> dict[str, Any]:
     api_keys_cfg = config_data.get("api_keys", {})
 
     return {
+        "task_type": ui_cfg.get("task_type", "diagram"),
         "text_provider": ui_cfg.get("text_provider", "openai_compatible"),
         "image_provider": ui_cfg.get("image_provider", "openai_compatible"),
         "text_api_key": openai_cfg.get("text_api_key") or openai_cfg.get("api_key") or api_keys_cfg.get("google_api_key", ""),
@@ -482,6 +594,7 @@ def load_paper_file(path_str: str) -> str:
 
 def build_exp_config(
     *,
+    task_type: str,
     text_provider: str,
     text_api_key: str,
     text_base_url: str,
@@ -503,6 +616,7 @@ def build_exp_config(
     )
     exp_config = ExpConfig(
         dataset_name="PromptStudio",
+        task_name=task_type,
         split_name="manual",
         exp_mode="prompt_studio",
         retrieval_setting="none",
@@ -518,43 +632,48 @@ def build_exp_config(
     return exp_config, text_runtime_clients, image_runtime_clients
 
 
-def planner_user_prompt(method_text: str, caption: str) -> str:
+def planner_user_prompt(method_text: str, caption: str, task_type: str) -> str:
+    meta = get_task_meta(task_type)
     return (
-        "Now, based on the following methodology section and diagram caption, provide a detailed description for the "
+        f"Now, based on the following {meta['content_label'].lower()} and {meta['intent_label'].lower()}, provide a detailed description for the "
         "figure to be generated.\n"
-        f"Methodology Section: {method_text}\n"
-        f"Diagram Caption: {caption}\n"
-        "Detailed description of the target figure to be generated (do not include figure titles):"
+        f"{meta['content_label']}: {method_text}\n"
+        f"{meta['intent_label']}: {caption}\n"
+        f"Detailed description of the target figure to be generated{meta['desc_output_suffix']}"
     )
 
 
-def stylist_user_prompt(planner_description: str, method_text: str, caption: str) -> str:
-    style_guide = (APP_ROOT / "style_guides" / "neurips2025_diagram_style_guide.md").read_text(encoding="utf-8")
+def stylist_user_prompt(planner_description: str, method_text: str, caption: str, task_type: str) -> str:
+    meta = get_task_meta(task_type)
+    style_guide = (APP_ROOT / "style_guides" / meta["style_guide"]).read_text(encoding="utf-8")
     return (
         f"Detailed Description: {planner_description}\n"
         f"Style Guidelines: {style_guide}\n"
-        f"Methodology Section: {method_text}\n"
-        f"Diagram Caption: {caption}\n"
+        f"{meta['content_label']}: {method_text}\n"
+        f"{meta['intent_label']}: {caption}\n"
         "Your Output:"
     )
 
 
 def export_prompt_markdown(record: dict[str, Any]) -> str:
+    task_type = record.get("task_type", "diagram")
+    meta = get_task_meta(task_type)
     lines = [
         f"# {record.get('title') or 'Prompt Studio Export'}",
         "",
         f"- Created: {record.get('created_at', '')}",
         f"- Updated: {record.get('updated_at', '')}",
-        f"- Figure Caption: {record.get('caption', '')}",
+        f"- Task Type: {task_type}",
+        f"- {meta['intent_label']}: {record.get('caption', '')}",
         "",
-        "## Methodology Section",
+        f"## {meta['content_label']}",
         "",
         record.get("method_text", ""),
         "",
         "## Planner System Prompt",
         "",
         "```text",
-        PlannerAgent(exp_config=ExpConfig(dataset_name='PromptStudio')).system_prompt,
+        PlannerAgent(exp_config=ExpConfig(dataset_name='PromptStudio', task_name=task_type)).system_prompt,
         "```",
         "",
         "## Planner User Prompt",
@@ -572,7 +691,7 @@ def export_prompt_markdown(record: dict[str, Any]) -> str:
         "## Stylist System Prompt",
         "",
         "```text",
-        StylistAgent(exp_config=ExpConfig(dataset_name='PromptStudio')).system_prompt,
+        StylistAgent(exp_config=ExpConfig(dataset_name='PromptStudio', task_name=task_type)).system_prompt,
         "```",
         "",
         "## Stylist User Prompt",
@@ -614,6 +733,7 @@ def encode_preview(path: Path) -> str:
 
 async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) -> dict[str, Any]:
     exp_config, text_runtime_clients, image_runtime_clients = build_exp_config(
+        task_type=payload.task_type,
         text_provider=payload.text_provider,
         text_api_key=payload.text_api_key,
         text_base_url=payload.text_base_url,
@@ -632,7 +752,7 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
             runtime_clients=text_runtime_clients,
             fallback=12000,
         )
-        planner_prompt = planner_user_prompt(payload.method_text, payload.caption)
+        planner_prompt = planner_user_prompt(payload.method_text, payload.caption, payload.task_type)
 
         async def emit_partial(field: str, event: Any):
             if not progress_callback:
@@ -669,7 +789,7 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
                 "retrieved_examples": [],
             }
             data = await planner.process(data)
-            response_list = [data["target_diagram_desc0"]]
+            response_list = [data[target_desc_key(payload.task_type)]]
 
         planner_output = response_list[0].strip()
         if not planner_output or planner_output == "Error":
@@ -679,7 +799,7 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
             progress_callback({"type": "prompt_output", "field": "planner_output", "value": planner_output})
             progress_callback({"type": "prompt_stage", "stage": "planner", "status": "completed"})
 
-        stylist_prompt = stylist_user_prompt(planner_output, payload.method_text, payload.caption)
+        stylist_prompt = stylist_user_prompt(planner_output, payload.method_text, payload.caption, payload.task_type)
         if progress_callback:
             progress_callback({"type": "prompt_stage", "stage": "stylist", "status": "running"})
 
@@ -701,10 +821,10 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
             data = {
                 "content": payload.method_text,
                 "visual_intent": payload.caption,
-                "target_diagram_desc0": planner_output,
+                target_desc_key(payload.task_type): planner_output,
             }
             data = await stylist.process(data)
-            response_list = [data["target_diagram_stylist_desc0"]]
+            response_list = [data[target_stylist_key(payload.task_type)]]
 
         stylist_output = response_list[0].strip()
         if not stylist_output or stylist_output == "Error":
@@ -721,6 +841,7 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
             "stylist_system_prompt": stylist_system,
             "stylist_user_prompt": stylist_prompt,
             "stylist_output": stylist_output,
+            "task_type": payload.task_type,
         }
     finally:
         await generation_utils.close_runtime_clients(text_runtime_clients)
@@ -729,6 +850,7 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
 
 async def generate_single_candidate(
     *,
+    task_type: str,
     final_prompt: str,
     caption: str,
     method_text: str,
@@ -745,6 +867,7 @@ async def generate_single_candidate(
     progress_callback=None,
 ) -> dict[str, Any]:
     exp_config, text_runtime_clients, image_runtime_clients = build_exp_config(
+        task_type=task_type,
         text_provider=text_provider,
         text_api_key=text_api_key,
         text_base_url=text_base_url,
@@ -761,7 +884,7 @@ async def generate_single_candidate(
             "content": method_text,
             "visual_intent": caption,
             "additional_info": {"rounded_ratio": aspect_ratio},
-            "target_diagram_desc0": final_prompt,
+            target_desc_key(task_type): final_prompt,
         }
         data = await visualizer.process(data, progress_callback=progress_callback)
         return data
@@ -772,6 +895,7 @@ async def generate_single_candidate(
 
 async def run_manual_critic(
     *,
+    task_type: str,
     image_path: Path,
     current_prompt: str,
     caption: str,
@@ -786,6 +910,7 @@ async def run_manual_critic(
     image_model: str,
 ) -> dict[str, Any]:
     exp_config, text_runtime_clients, image_runtime_clients = build_exp_config(
+        task_type=task_type,
         text_provider=text_provider,
         text_api_key=text_api_key,
         text_base_url=text_base_url,
@@ -801,14 +926,14 @@ async def run_manual_critic(
         data = {
             "content": method_text,
             "visual_intent": caption,
-            "target_diagram_desc0": current_prompt,
-            "target_diagram_desc0_base64_jpg": image_b64,
+            target_desc_key(task_type): current_prompt,
+            target_desc_image_key(task_type): image_b64,
             "current_critic_round": 0,
         }
         data = await critic.process(data, source="planner")
         return {
-            "critic_suggestions": data.get("target_diagram_critic_suggestions0", ""),
-            "revised_description": data.get("target_diagram_critic_desc0", ""),
+            "critic_suggestions": data.get(critic_suggestions_key(task_type, 0), ""),
+            "revised_description": data.get(critic_desc_key(task_type, 0), ""),
         }
     finally:
         await generation_utils.close_runtime_clients(text_runtime_clients)
@@ -817,6 +942,7 @@ async def run_manual_critic(
 
 async def run_manual_critic_stream(
     *,
+    task_type: str,
     image_path: Path,
     current_prompt: str,
     caption: str,
@@ -832,6 +958,7 @@ async def run_manual_critic_stream(
     progress_callback=None,
 ) -> dict[str, Any]:
     exp_config, text_runtime_clients, image_runtime_clients = build_exp_config(
+        task_type=task_type,
         text_provider=text_provider,
         text_api_key=text_api_key,
         text_base_url=text_base_url,
@@ -844,8 +971,9 @@ async def run_manual_critic_stream(
     try:
         critic = CriticAgent(exp_config=exp_config)
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+        meta = get_task_meta(task_type)
         content_list = [
-            {"type": "text", "text": "Target Diagram for Critique:"},
+            {"type": "text", "text": meta["critic_target"]},
             {
                 "type": "image",
                 "source": {
@@ -856,7 +984,12 @@ async def run_manual_critic_stream(
             },
             {
                 "type": "text",
-                "text": f"Detailed Description: {current_prompt}\nMethodology Section: {method_text}\nFigure Caption: {caption}\nYour Output:",
+                "text": (
+                    f"Detailed Description: {current_prompt}\n"
+                    f"{meta['critic_context_labels'][0]}: {method_text}\n"
+                    f"{meta['critic_context_labels'][1]}: {caption}\n"
+                    "Your Output:"
+                ),
             },
         ]
 
@@ -890,14 +1023,14 @@ async def run_manual_critic_stream(
             data = {
                 "content": method_text,
                 "visual_intent": caption,
-                "target_diagram_desc0": current_prompt,
-                "target_diagram_desc0_base64_jpg": image_b64,
+                target_desc_key(task_type): current_prompt,
+                target_desc_image_key(task_type): image_b64,
                 "current_critic_round": 0,
             }
             data = await critic.process(data, source="planner")
             result = {
-                "critic_suggestions": data.get("target_diagram_critic_suggestions0", ""),
-                "revised_description": data.get("target_diagram_critic_desc0", ""),
+                "critic_suggestions": data.get(critic_suggestions_key(task_type, 0), ""),
+                "revised_description": data.get(critic_desc_key(task_type, 0), ""),
             }
             raw_output = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -932,6 +1065,7 @@ class PaperPathRequest(BaseModel):
 
 class PromptRequest(BaseModel):
     title: str = ""
+    task_type: str = "diagram"
     caption: str
     method_text: str
     text_provider: str = "openai_compatible"
@@ -956,6 +1090,10 @@ class CriticRequest(PromptRequest):
     record_id: str
     candidate_id: int
     current_prompt: str
+
+
+class PlotCodeRequest(BaseModel):
+    code: str
 
 
 app = FastAPI(title="Prompt Studio")
@@ -1063,10 +1201,15 @@ INDEX_HTML = """
       </div>
       <div class="panel">
         <h3>当前任务</h3>
+        <label>任务类型</label>
+        <select id="taskType" onchange="refreshTaskMode()">
+          <option value="diagram">Diagram</option>
+          <option value="plot">Plot</option>
+        </select>
         <input id="title" placeholder="本次任务标题（例如：方法总架构）" />
-        <label>方法内容</label>
+        <label id="contentLabel">方法内容</label>
         <textarea id="methodText" placeholder="方法内容 / 某一章某一节"></textarea>
-        <label>图题 / 图注</label>
+        <label id="intentLabel">图题 / 图注</label>
         <textarea id="caption" placeholder="图题 / 图注"></textarea>
         <div class="row">
           <button id="generatePromptsBtn" onclick="generatePrompts()">生成 Planner + Stylist 提示词</button>
@@ -1099,6 +1242,20 @@ INDEX_HTML = """
           <button class="secondary" onclick="downloadMarkdown()">导出 Markdown Prompt Pack</button>
         </div>
         <div id="jobStatus" class="muted"></div>
+        <div id="plotCodeStudio" style="display:none">
+          <hr>
+          <h3>Plot 代码工作台</h3>
+          <div id="plotCodeStatus" class="muted">未载入代码</div>
+          <textarea id="plotCodeEditor" placeholder="这里会显示生成的 Matplotlib 代码"></textarea>
+          <div class="row">
+            <button class="secondary" onclick="runPlotCode()">运行代码</button>
+            <button class="secondary" onclick="downloadPlotCode()">下载 .py</button>
+            <button class="secondary" onclick="downloadPlotImage()">下载 PNG</button>
+          </div>
+          <div id="plotCodePreviewWrap" style="display:none">
+            <img id="plotCodePreview" class="img" src="" />
+          </div>
+        </div>
         <hr>
         <h3>Critic 工作台</h3>
         <div id="criticStatus" class="muted">未运行</div>
@@ -1131,10 +1288,36 @@ let currentJobId = null;
 let sectionContentMap = {};
 let currentEventSource = null;
 let currentCriticCandidateId = null;
+let candidateCodeMap = {};
+
+function getTaskMeta() {
+  const taskType = document.getElementById('taskType')?.value || 'diagram';
+  if (taskType === 'plot') {
+    return {
+      taskType,
+      contentLabel: '原始数据',
+      contentPlaceholder: '原始数据 / 表格 / JSON / CSV',
+      intentLabel: '作图意图',
+      intentPlaceholder: '例如：比较不同方法的 PSNR/SSIM 柱状图',
+      sectionActionLabel: '用作原始数据',
+      codeLabel: 'Matplotlib 代码',
+    };
+  }
+  return {
+    taskType: 'diagram',
+    contentLabel: '方法内容',
+    contentPlaceholder: '方法内容 / 某一章某一节',
+    intentLabel: '图题 / 图注',
+    intentPlaceholder: '图题 / 图注',
+    sectionActionLabel: '用作方法内容',
+    codeLabel: '生成代码',
+  };
+}
 
 function payloadBase() {
   return {
     title: document.getElementById('title').value,
+    task_type: document.getElementById('taskType').value,
     caption: document.getElementById('caption').value,
     method_text: document.getElementById('methodText').value,
     text_provider: document.getElementById('textProvider').value,
@@ -1153,6 +1336,32 @@ function setBusy(buttonId, busy, busyText, idleText) {
   if (!btn) return;
   btn.disabled = !!busy;
   btn.textContent = busy ? busyText : idleText;
+}
+
+function refreshTaskMode() {
+  const meta = getTaskMeta();
+  const contentLabel = document.getElementById('contentLabel');
+  const intentLabel = document.getElementById('intentLabel');
+  const methodText = document.getElementById('methodText');
+  const caption = document.getElementById('caption');
+  if (contentLabel) contentLabel.textContent = meta.contentLabel;
+  if (intentLabel) intentLabel.textContent = meta.intentLabel;
+  if (methodText) methodText.placeholder = meta.contentPlaceholder;
+  if (caption) caption.placeholder = meta.intentPlaceholder;
+  const plotStudio = document.getElementById('plotCodeStudio');
+  if (plotStudio) plotStudio.style.display = meta.taskType === 'plot' ? 'block' : 'none';
+  if (Object.keys(sectionContentMap).length) {
+    const box = document.getElementById('sections');
+    if (box && box.dataset.treeJson) {
+      renderSectionTree(JSON.parse(box.dataset.treeJson));
+    }
+  }
+}
+
+function loadPlotCodeFromCandidate(candidateId) {
+  const code = candidateCodeMap[candidateId] || '';
+  document.getElementById('plotCodeEditor').value = code;
+  document.getElementById('plotCodeStatus').innerText = code ? `已载入候选 ${candidateId} 的代码` : '候选没有可用代码';
 }
 
 function escapeHtml(text) {
@@ -1304,6 +1513,7 @@ function refreshMarkdownPreviews() {
 
 async function loadDefaults() {
   const data = await api('/studio/api/defaults');
+  document.getElementById('taskType').value = data.task_type || 'diagram';
   document.getElementById('paperFilePath').value = data.paper_file_path || '';
   document.getElementById('textProvider').value = data.text_provider;
   document.getElementById('imageProvider').value = data.image_provider;
@@ -1323,6 +1533,7 @@ async function loadDefaults() {
   }
   document.getElementById('textModel').value = data.text_model || '';
   document.getElementById('imageModel').value = data.image_model || '';
+  refreshTaskMode();
   refreshMarkdownPreviews();
   if (data.paper_file_path) {
     try { await loadPaperFile(false); } catch (e) {}
@@ -1350,6 +1561,8 @@ async function parsePaper() {
 
 function renderSectionTree(nodes) {
   const box = document.getElementById('sections');
+  box.dataset.treeJson = JSON.stringify(nodes || []);
+  const meta = getTaskMeta();
   function renderNode(node) {
     const children = (node.children || []).map(renderNode).join('');
     return `
@@ -1357,7 +1570,7 @@ function renderSectionTree(nodes) {
         <summary><strong>${node.level}</strong> ${node.title}</summary>
         <div class="muted">长度：${(node.content || '').length} 字</div>
         <div class="row">
-          <button class="secondary" onclick="useSectionById('${node.id}')">用作方法内容</button>
+          <button class="secondary" onclick="useSectionById('${node.id}')">${meta.sectionActionLabel}</button>
           <button class="secondary" onclick="copySectionById('${node.id}')">复制正文</button>
         </div>
         ${children ? `<div style="padding-left:16px">${children}</div>` : ''}
@@ -1539,17 +1752,73 @@ window.addEventListener('beforeunload', () => {
 
 function renderCandidates(candidates) {
   const box = document.getElementById('candidates');
+  candidateCodeMap = {};
+  for (const c of candidates || []) {
+    if (c.generated_code) candidateCodeMap[c.candidate_id] = c.generated_code;
+  }
+  const meta = getTaskMeta();
   box.innerHTML = candidates.map(c => `
     <div class="candidate">
       <div><strong>候选 ${c.candidate_id}</strong> | ${c.status}</div>
       <div class="muted">${c.message || ''}</div>
       ${((c.image_url || (c.image_path && currentRecordId ? `/prompt-studio-history/${currentRecordId}/${c.image_path}` : ''))) ? `<img class="img" src="${c.image_url || `/prompt-studio-history/${currentRecordId}/${c.image_path}`}">` : ''}
+      ${c.generated_code ? `<details><summary>${meta.codeLabel}</summary><pre>${escapeHtml(c.generated_code)}</pre></details>` : ''}
       <div class="row">
+        ${c.generated_code ? `<button class="secondary" onclick="loadPlotCodeFromCandidate(${c.candidate_id})">载入代码</button>` : ''}
         ${((c.image_url || (c.image_path && currentRecordId ? `/prompt-studio-history/${currentRecordId}/${c.image_path}` : ''))) ? `<button id="criticBtn-${c.candidate_id}" class="secondary" onclick="runCritic(${c.candidate_id})">运行 Critic</button>` : ''}
       </div>
       ${c.critic ? `<pre>${c.critic.critic_suggestions}\\n\\n---\\n\\n${c.critic.revised_description}</pre>` : ''}
     </div>
   `).join('');
+}
+
+async function runPlotCode() {
+  const code = document.getElementById('plotCodeEditor').value.trim();
+  if (!code) {
+    alert('请先载入或填写 Matplotlib 代码');
+    return;
+  }
+  document.getElementById('plotCodeStatus').innerText = '正在执行代码...';
+  try {
+    const data = await api('/studio/api/plot/execute', {method:'POST', body: JSON.stringify({code})});
+    if (data.image_data_url) {
+      document.getElementById('plotCodePreview').src = data.image_data_url;
+      document.getElementById('plotCodePreviewWrap').style.display = 'block';
+      document.getElementById('plotCodeStatus').innerText = '代码执行成功';
+    } else {
+      document.getElementById('plotCodeStatus').innerText = '代码执行失败';
+    }
+  } catch (e) {
+    document.getElementById('plotCodeStatus').innerText = '代码执行失败';
+    alert(`执行 Matplotlib 代码失败: ${e}`);
+  }
+}
+
+function downloadPlotCode() {
+  const code = document.getElementById('plotCodeEditor').value.trim();
+  if (!code) {
+    alert('没有可下载的代码');
+    return;
+  }
+  const blob = new Blob([code], {type: 'text/x-python'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'plot_candidate.py';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadPlotImage() {
+  const src = document.getElementById('plotCodePreview').src;
+  if (!src) {
+    alert('请先运行代码并生成预览图');
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = src;
+  a.download = 'plot_candidate.png';
+  a.click();
 }
 
 async function runCritic(candidateId) {
@@ -1586,6 +1855,7 @@ async function renderHistory() {
       <div><strong>${r.title || r.id}</strong></div>
       ${r.source === 'legacy_demo' ? `<div class="muted">旧文件：${r.legacy_name || r.id}</div>` : ''}
       <div class="muted">${r.updated_at}</div>
+      <div class="muted">任务：${r.task_type || 'diagram'}</div>
       <div class="muted">来源：${r.source === 'legacy_demo' ? '旧 demo' : 'Prompt Studio'}</div>
       <div class="muted">候选图：${r.candidate_count || 0}</div>
       <div class="row">
@@ -1609,6 +1879,8 @@ async function archiveHistory(recordId) {
 async function loadHistory(recordId) {
   const data = await api(`/studio/api/history/${recordId}`);
   currentRecordId = recordId;
+  document.getElementById('taskType').value = data.task_type || 'diagram';
+  refreshTaskMode();
   document.getElementById('title').value = data.title || '';
   document.getElementById('caption').value = data.caption || '';
   document.getElementById('methodText').value = data.method_text || '';
@@ -1690,6 +1962,17 @@ async def parse_paper(req: ParseRequest):
     return {"sections": sections, "tree": build_section_tree(sections)}
 
 
+@app.post("/studio/api/plot/execute")
+async def execute_plot_code(req: PlotCodeRequest):
+    image_b64 = await asyncio.to_thread(_execute_plot_code_worker, req.code)
+    if not image_b64:
+        raise HTTPException(400, "plot code execution failed")
+    return {
+        "image_base64": image_b64,
+        "image_data_url": f"data:image/jpeg;base64,{image_b64}",
+    }
+
+
 @app.post("/studio/api/prompts")
 async def generate_prompts(req: PromptRequest):
     record_id = uuid.uuid4().hex
@@ -1702,9 +1985,10 @@ async def generate_prompts(req: PromptRequest):
                 "created_at": now_str(),
                 "updated_at": now_str(),
                 "title": req.title,
+                "task_type": req.task_type,
                 "caption": req.caption,
                 "method_text": req.method_text,
-                "planner_user_prompt": planner_user_prompt(req.method_text, req.caption),
+                "planner_user_prompt": planner_user_prompt(req.method_text, req.caption, req.task_type),
                 "planner_output": "",
                 "stylist_user_prompt": "",
                 "stylist_output": "",
@@ -1733,6 +2017,7 @@ async def generate_prompts(req: PromptRequest):
                                     current.get("planner_output", ""),
                                     req.method_text,
                                     req.caption,
+                                    req.task_type,
                                 ),
                             },
                         )
@@ -1823,6 +2108,7 @@ async def start_image_batch(req: BatchRequest):
                     persist_job_candidates(req.record_id, JOBS[job_id]["candidates"])
 
                 result = await generate_single_candidate(
+                    task_type=req.task_type,
                     final_prompt=req.final_prompt,
                     caption=req.caption,
                     method_text=req.method_text,
@@ -1838,16 +2124,27 @@ async def start_image_batch(req: BatchRequest):
                     candidate_id=candidate_id,
                     progress_callback=progress_callback,
                 )
-                final_key = next((k for k in [f"target_diagram_critic_desc0_base64_jpg", "target_diagram_stylist_desc0_base64_jpg", "target_diagram_desc0_base64_jpg"] if result.get(k)), None)
+                final_key = select_candidate_image_key(result, req.task_type)
+                generated_code = select_candidate_code(result, req.task_type)
                 image_url = ""
                 image_path = ""
                 if final_key:
-                    image_path_obj = record_dir(req.record_id) / f"candidate_{candidate_id}.png"
+                    image_path_obj = record_dir(req.record_id) / f"{req.task_type}_candidate_{candidate_id}.png"
                     saved = save_base64_image_as_png(result[final_key], image_path_obj)
                     if saved:
                         image_path = saved.name
                         image_url = f"/prompt-studio-history/{req.record_id}/{saved.name}"
-                patch_candidate(job_id, candidate_id, {"status": "completed", "message": "已完成", "image_url": image_url, "image_path": image_path})
+                patch_candidate(
+                    job_id,
+                    candidate_id,
+                    {
+                        "status": "completed",
+                        "message": "已完成",
+                        "image_url": image_url,
+                        "image_path": image_path,
+                        "generated_code": generated_code,
+                    },
+                )
                 persist_job_candidates(req.record_id, JOBS[job_id]["candidates"])
                 update_job(
                     job_id,
@@ -1960,6 +2257,7 @@ async def run_critic(req: CriticRequest):
 
             emit_job_event(job_id, {"type": "critic_stage", "status": "running"})
             critic = await run_manual_critic_stream(
+                task_type=req.task_type,
                 image_path=image_path,
                 current_prompt=req.current_prompt,
                 caption=req.caption,
@@ -2049,6 +2347,7 @@ async def save_defaults(req: dict[str, Any]):
     config_data.setdefault("defaults", {})["model_name"] = req.get("text_model", "")
     config_data.setdefault("defaults", {})["image_model_name"] = req.get("image_model", "")
     ui_defaults = config_data.setdefault("ui_defaults", {})
+    ui_defaults["task_type"] = req.get("task_type", "diagram")
     ui_defaults["text_provider"] = req.get("text_provider", "openai_compatible")
     ui_defaults["image_provider"] = req.get("image_provider", "openai_compatible")
     ui_defaults["paper_file_path"] = req.get("paper_file_path", "")
