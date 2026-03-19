@@ -14,7 +14,7 @@ from typing import Any
 import copy
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import json_repair
@@ -1098,6 +1098,11 @@ class PlotCodeRequest(BaseModel):
 
 app = FastAPI(title="Prompt Studio")
 app.mount("/prompt-studio-history", StaticFiles(directory=str(HISTORY_ROOT)), name="prompt_studio_history")
+
+
+@app.get("/", include_in_schema=False)
+async def root_home():
+    return RedirectResponse(url="/studio", status_code=307)
 
 
 @app.on_event("shutdown")
