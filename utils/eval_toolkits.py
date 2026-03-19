@@ -124,7 +124,8 @@ async def _run_single_eval_ref(
     visual_intent: str,
     gt_image_base64: str,
     model_image_base64: str,
-    model_name: str
+    model_name: str,
+    runtime_clients=None,
 ) -> tuple[str, dict]:
     """Run a single evaluation dimension for referenced comparison."""
     # Get the appropriate prompt based on task_name and eval_dim
@@ -177,6 +178,7 @@ async def _run_single_eval_ref(
                     candidate_count=1,
                     max_output_tokens=50000,
                 ),
+                runtime_clients=runtime_clients,
             )
         elif "gpt" in model_name or "o1" in model_name or "o3" in model_name:
             response_text_list = await call_openai_with_retry_async(
@@ -190,6 +192,7 @@ async def _run_single_eval_ref(
                 },
                 max_attempts=5,
                 retry_delay=30,
+                runtime_clients=runtime_clients,
             )
         else:
             response_text_list = await call_claude_with_retry_async(
@@ -203,6 +206,7 @@ async def _run_single_eval_ref(
                 },
                 max_attempts=5,
                 retry_delay=30,
+                runtime_clients=runtime_clients,
             )
         clean_json = response_text_list[0].replace("```json", "").replace("```", "").strip()
         res_obj = json_repair.loads(clean_json)
@@ -226,7 +230,7 @@ async def _run_single_eval_ref(
 
 
 async def get_score_for_image_referenced(
-    sample_data: dict, task_name: str = "diagram", model_name: str = "", work_dir = None
+    sample_data: dict, task_name: str = "diagram", model_name: str = "", work_dir = None, runtime_clients=None
 ) -> dict:
     """Get score for diagram referenced comparison.
     
@@ -282,7 +286,8 @@ async def get_score_for_image_referenced(
             visual_intent,
             gt_image_base64,
             model_image_base64,
-            model_name
+            model_name,
+            runtime_clients=runtime_clients,
         ) for dim in dims
     ]
 

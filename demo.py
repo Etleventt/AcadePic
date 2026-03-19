@@ -21,12 +21,17 @@ import streamlit as st
 import asyncio
 import base64
 import json
+import queue
+import threading
+import uuid
 from io import BytesIO
 from PIL import Image
 from pathlib import Path
 import sys
 import os
 from datetime import datetime
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 # 将项目根目录添加到路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -43,7 +48,10 @@ try:
     from agents.polish_agent import PolishAgent
     print("调试：已导入所有代理模块")
     from utils import config
+    from utils import generation_utils
     from utils.paperviz_processor import PaperVizProcessor
+    from utils.result_export import export_batch_result_images, get_final_image_key
+    from utils.image_utils import save_base64_image_as_png
     print("调试：已导入工具模块")
 
     import yaml
@@ -76,6 +84,11 @@ st.set_page_config(
     page_icon="🍌"
 )
 
+@st.cache_resource
+def get_runner_registry():
+    """后台任务注册表，需要跨 Streamlit rerun 持久化。"""
+    return {}
+
 def clean_text(text):
     """清理文本，移除无效的 UTF-8 代理字符。"""
     if not text:
@@ -96,6 +109,135 @@ def base64_to_image(b64_str):
         return Image.open(BytesIO(image_data))
     except Exception:
         return None
+
+
+def list_history_json_files():
+    """列出已保存的历史结果文件，按时间倒序。"""
+    results_dir = Path(__file__).parent / "results" / "demo"
+    if not results_dir.exists():
+        return []
+    return sorted(results_dir.glob("demo_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def format_history_label(json_path: Path) -> str:
+    """格式化历史记录标签，便于在下拉列表中查看。"""
+    modified_time = datetime.fromtimestamp(json_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    size_mb = json_path.stat().st_size / (1024 * 1024)
+    return f"{json_path.name} | {modified_time} | {size_mb:.1f} MB"
+
+
+def infer_exp_mode_from_results(results):
+    """根据结果字段推断流水线模式，兼容旧版历史 JSON。"""
+    if not results:
+        return "demo_planner_critic"
+
+    for item in results:
+        if any(key.startswith("target_diagram_stylist_desc0") for key in item.keys()):
+            return "demo_full"
+    return "demo_planner_critic"
+
+
+def load_history_results(json_path: Path):
+    """从历史 JSON 文件加载结果列表。"""
+    with open(json_path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+
+    if not isinstance(loaded, list):
+        raise ValueError("历史 JSON 格式不正确，预期为结果列表。")
+
+    return loaded
+
+
+def fetch_openai_compatible_models(base_url: str, api_key: str):
+    """从 OpenAI-compatible 站点读取 /v1/models 列表。"""
+    if not base_url:
+        raise ValueError("缺少 Base URL。")
+
+    url = f"{base_url.rstrip('/')}/v1/models"
+    req = urllib_request.Request(url)
+    req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+        payload = json.loads(body)
+
+    models = payload.get("data", [])
+    if not isinstance(models, list):
+        raise ValueError("模型列表格式不正确。")
+    return models
+
+
+def filter_model_ids(models, usage: str):
+    """按用途筛选模型。usage: text | image"""
+    filtered = []
+    for item in models:
+        model_id = item.get("id", "")
+        description = str(item.get("description", "")).lower()
+        lowered_id = model_id.lower()
+        is_image = (
+            "image generation" in description
+            or "image" in lowered_id
+            or "imagen" in lowered_id
+        ) and "video" not in description and not lowered_id.startswith("veo")
+
+        if usage == "image" and is_image:
+            filtered.append(model_id)
+        elif usage == "text" and not is_image:
+            filtered.append(model_id)
+
+    return filtered
+
+
+def save_current_settings_to_config(
+    *,
+    text_provider: str,
+    text_api_key: str,
+    text_base_url: str,
+    model_name: str,
+    image_provider: str,
+    image_api_key: str,
+    image_base_url: str,
+    image_model_name: str,
+):
+    """将当前 UI 配置写回 model_config.yaml，作为新页面默认值。"""
+    config_path = Path(__file__).parent / "configs" / "model_config.yaml"
+    config_data = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = yaml.safe_load(f) or {}
+
+    defaults = config_data.setdefault("defaults", {})
+    defaults["model_name"] = model_name
+    defaults["image_model_name"] = image_model_name
+
+    ui_defaults = config_data.setdefault("ui_defaults", {})
+    ui_defaults["text_provider"] = text_provider
+    ui_defaults["image_provider"] = image_provider
+
+    openai_cfg = config_data.setdefault("openai_compatible", {})
+    google_cfg = config_data.setdefault("google_compatible", {})
+    api_keys_cfg = config_data.setdefault("api_keys", {})
+
+    if text_provider == "openai_compatible":
+        openai_cfg["text_api_key"] = text_api_key
+        openai_cfg["text_base_url"] = text_base_url
+    else:
+        google_cfg["text_api_key"] = text_api_key
+        google_cfg["base_url"] = text_base_url
+        api_keys_cfg["google_api_key"] = text_api_key
+
+    if image_provider == "openai_compatible":
+        openai_cfg["image_api_key"] = image_api_key
+        openai_cfg["image_base_url"] = image_base_url
+    else:
+        google_cfg["image_api_key"] = image_api_key
+        google_cfg["base_url"] = image_base_url
+        api_keys_cfg["google_api_key"] = image_api_key
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config_data, f, allow_unicode=True, sort_keys=False)
 
 def create_sample_inputs(method_content, caption, diagram_type="Pipeline", aspect_ratio="16:9", num_copies=10, max_critic_rounds=3):
     """创建多份输入数据副本用于并行处理。"""
@@ -120,24 +262,45 @@ def create_sample_inputs(method_content, caption, diagram_type="Pipeline", aspec
 
     return inputs
 
-async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", retrieval_setting="auto", model_name="", image_model_name="", provider="evolink", api_key=""):
+async def process_parallel_candidates(
+    data_list,
+    exp_mode="dev_planner_critic",
+    retrieval_setting="auto",
+    model_name="",
+    image_model_name="",
+    text_provider="openai_compatible",
+    text_api_key="",
+    text_base_url="",
+    image_provider="openai_compatible",
+    image_api_key="",
+    image_base_url="",
+    progress_callback=None,
+    stop_event=None,
+    prompt_only: bool = False,
+):
     """使用 PaperVizProcessor 并行处理多个候选方案。"""
     print(f"\n{'='*60}")
     print(f"[DEBUG] process_parallel_candidates 开始")
-    print(f"[DEBUG]   provider={provider}, model={model_name}, image_model={image_model_name}")
+    print(f"[DEBUG]   text_provider={text_provider}, image_provider={image_provider}, model={model_name}, image_model={image_model_name}")
     print(f"[DEBUG]   exp_mode={exp_mode}, retrieval={retrieval_setting}, candidates={len(data_list)}")
-    print(f"[DEBUG]   api_key={'已设置 (' + api_key[:8] + '...)' if api_key else '未设置'}")
+    print(f"[DEBUG]   text_api_key={'已设置 (' + text_api_key[:8] + '...)' if text_api_key else '未设置'}")
+    print(f"[DEBUG]   image_api_key={'已设置 (' + image_api_key[:8] + '...)' if image_api_key else '未设置'}")
     print(f"{'='*60}")
 
-    # 使用界面传入的 API Key 初始化 Provider
-    if api_key:
-        from utils import generation_utils
-        if provider == "evolink":
-            generation_utils.init_evolink_provider(api_key)
-        elif provider == "gemini":
-            generation_utils.init_gemini_client(api_key)
-    else:
-        print(f"[DEBUG] ⚠️ 未提供 API Key，Provider 可能无法正常工作")
+    text_runtime_clients = generation_utils.create_runtime_clients(
+        provider=text_provider,
+        api_key=text_api_key,
+        base_url=text_base_url,
+    )
+    image_runtime_clients = generation_utils.create_runtime_clients(
+        provider=image_provider,
+        api_key=image_api_key,
+        base_url=image_base_url,
+    )
+    if not text_api_key:
+        print(f"[DEBUG] ⚠️ 未提供文本 API Key，将回退到配置文件/环境变量")
+    if not image_api_key:
+        print(f"[DEBUG] ⚠️ 未提供图像 API Key，将回退到配置文件/环境变量")
 
     # 创建实验配置
     exp_config = config.ExpConfig(
@@ -147,10 +310,14 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
         retrieval_setting=retrieval_setting,
         model_name=model_name,
         image_model_name=image_model_name,
-        provider=provider,
+        provider=text_provider,
+        text_provider=text_provider,
+        image_provider=image_provider,
         work_dir=Path(__file__).parent,
+        text_runtime_clients=text_runtime_clients,
+        image_runtime_clients=image_runtime_clients,
     )
-    print(f"[DEBUG] ExpConfig 已创建: provider={exp_config.provider}, model={exp_config.model_name}, image_model={exp_config.image_model_name}")
+    print(f"[DEBUG] ExpConfig 已创建: text_provider={exp_config.text_provider}, image_provider={exp_config.image_provider}, model={exp_config.model_name}, image_model={exp_config.image_model_name}")
 
     # 初始化处理器及所有代理
     processor = PaperVizProcessor(
@@ -166,24 +333,319 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
 
     # 并行处理所有候选方案（并发量由处理器控制）
     results = []
-    concurrent_num = 3  # 控制并发量，避免触发 API 限流 (429)
+    concurrent_num = 3  # 默认并发量
+    if text_provider == "openai_compatible":
+        # OpenAI-compatible 文本代理在长 prompt 下更容易被并发压垮，默认串行更稳
+        concurrent_num = 1
 
     try:
         async for result_data in processor.process_queries_batch(
-            data_list, max_concurrent=concurrent_num, do_eval=False
+            data_list,
+            max_concurrent=concurrent_num,
+            do_eval=False,
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+            prompt_only=prompt_only,
         ):
             results.append(result_data)
     finally:
-        # 关闭 Evolink Provider 的共享 session，避免资源泄漏
-        from utils import generation_utils
-        if generation_utils.evolink_provider and hasattr(generation_utils.evolink_provider, 'close'):
-            await generation_utils.evolink_provider.close()
+        await generation_utils.close_runtime_clients(text_runtime_clients)
+        await generation_utils.close_runtime_clients(image_runtime_clients)
 
     return results
 
-async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K", api_key="", provider="evolink"):
+
+def init_generation_state():
+    """初始化生成任务状态。"""
+    st.session_state.setdefault("generation_run_id", None)
+    st.session_state.setdefault("generation_status", "idle")
+    st.session_state.setdefault("generation_total", 0)
+    st.session_state.setdefault("generation_completed", 0)
+    st.session_state.setdefault("generation_candidates", {})
+    st.session_state.setdefault("partial_results", {})
+    st.session_state.setdefault("generation_error", "")
+    st.session_state.setdefault("generation_timestamp", "")
+    st.session_state.setdefault("generation_prompt_only", False)
+    st.session_state.setdefault("current_run_json_file", "")
+    st.session_state.setdefault("current_run_images_dir", "")
+
+
+def reset_generation_state(clear_results: bool = False):
+    """重置生成任务状态。"""
+    for key, value in {
+        "generation_run_id": None,
+        "generation_status": "idle",
+        "generation_total": 0,
+        "generation_completed": 0,
+        "generation_candidates": {},
+        "partial_results": {},
+        "generation_error": "",
+        "generation_timestamp": "",
+        "generation_prompt_only": False,
+        "current_run_json_file": "",
+        "current_run_images_dir": "",
+    }.items():
+        st.session_state[key] = value
+    if clear_results:
+        for key in ["results", "json_file", "images_dir", "exp_mode", "timestamp"]:
+            st.session_state.pop(key, None)
+
+
+def build_candidate_state(total_candidates: int):
+    """创建候选方案状态表。"""
+    return {
+        idx: {
+            "status": "queued",
+            "stage": "queued",
+            "message": "等待处理",
+        }
+        for idx in range(total_candidates)
+    }
+
+
+def persist_generation_results(results, exp_mode: str):
+    """保存结果 JSON 和图片。"""
+    results_dir = Path(__file__).parent / "results" / "demo"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    json_filename = results_dir / f"demo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(json_filename, "w", encoding="utf-8", errors="surrogateescape") as f:
+        json_string = json.dumps(results, ensure_ascii=False, indent=4)
+        json_string = json_string.encode("utf-8", "ignore").decode("utf-8")
+        f.write(json_string)
+
+    images_dir = json_filename.with_suffix("")
+    saved_image_paths = export_batch_result_images(
+        results,
+        output_dir=images_dir,
+        task_name="diagram",
+        exp_mode=exp_mode,
+    )
+    return json_filename, images_dir, saved_image_paths
+
+
+def init_current_run_output_paths():
+    """为当前运行创建固定的实时输出路径。"""
+    results_dir = Path(__file__).parent / "results" / "demo"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    json_filename = results_dir / f"demo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    images_dir = json_filename.with_suffix("")
+    images_dir.mkdir(parents=True, exist_ok=True)
+    st.session_state["current_run_json_file"] = str(json_filename)
+    st.session_state["current_run_images_dir"] = str(images_dir)
+
+
+def persist_partial_generation_state():
+    """将当前已完成的候选实时写入 JSON 和图片文件。"""
+    json_file = st.session_state.get("current_run_json_file", "")
+    images_dir = st.session_state.get("current_run_images_dir", "")
+    if not json_file or not images_dir:
+        return
+
+    partial_results = st.session_state.get("partial_results", {})
+    ordered_results = [partial_results[idx] for idx in sorted(partial_results.keys())]
+    json_path = Path(json_file)
+    with open(json_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        json_string = json.dumps(ordered_results, ensure_ascii=False, indent=4)
+        json_string = json_string.encode("utf-8", "ignore").decode("utf-8")
+        f.write(json_string)
+
+    images_path = Path(images_dir)
+    exp_mode = st.session_state.get("active_exp_mode", "demo_planner_critic")
+    for candidate_id, result in partial_results.items():
+        final_image_key = get_final_image_key(result, task_name="diagram", exp_mode=exp_mode)
+        if not final_image_key:
+            continue
+        target_png = images_path / f"candidate_{candidate_id}.png"
+        if target_png.exists():
+            continue
+        save_base64_image_as_png(result[final_image_key], target_png)
+
+
+def launch_generation_worker(worker_params: dict):
+    """在后台线程中启动生成任务。"""
+    runner_registry = get_runner_registry()
+    run_id = str(uuid.uuid4())
+    event_queue: queue.Queue = queue.Queue()
+    stop_event = threading.Event()
+
+    def progress_callback(event):
+        event_queue.put(event)
+
+    def worker():
+        try:
+            event_queue.put({"type": "run_started"})
+            results = asyncio.run(
+                process_parallel_candidates(
+                    **worker_params,
+                    progress_callback=progress_callback,
+                    stop_event=stop_event,
+                )
+            )
+            event_queue.put({"type": "run_finished", "results": results})
+        except Exception as e:
+            event_queue.put({"type": "run_failed", "error": str(e)})
+        finally:
+            event_queue.put({"type": "worker_done"})
+
+    thread = threading.Thread(target=worker, daemon=True)
+    runner_registry[run_id] = {
+        "thread": thread,
+        "queue": event_queue,
+        "stop_event": stop_event,
+    }
+    thread.start()
+    return run_id
+
+
+def consume_generation_events():
+    """消费后台任务事件并更新页面状态。"""
+    runner_registry = get_runner_registry()
+    run_id = st.session_state.get("generation_run_id")
+    if not run_id or run_id not in runner_registry:
+        return
+
+    runner = runner_registry[run_id]
+    while True:
+        try:
+            event = runner["queue"].get_nowait()
+        except queue.Empty:
+            break
+
+        event_type = event.get("type")
+        if event_type == "run_started":
+            st.session_state["generation_status"] = "running"
+        elif event_type == "candidate_progress":
+            candidate_id = event["candidate_id"]
+            candidate_state = st.session_state["generation_candidates"].setdefault(candidate_id, {})
+            candidate_state.update(
+                {
+                    "status": event.get("status", candidate_state.get("status", "queued")),
+                    "stage": event.get("stage", candidate_state.get("stage", "queued")),
+                    "message": event.get("message", ""),
+                }
+            )
+        elif event_type == "candidate_prompt":
+            candidate_id = event["candidate_id"]
+            candidate_state = st.session_state["generation_candidates"].setdefault(candidate_id, {})
+            prompts = candidate_state.setdefault("prompts", [])
+            prompts.append(
+                {
+                    "stage": event.get("stage", ""),
+                    "prompt_key": event.get("prompt_key", ""),
+                    "text": event.get("text", ""),
+                }
+            )
+        elif event_type == "candidate_result":
+            candidate_id = event["candidate_id"]
+            st.session_state["partial_results"][candidate_id] = event["result"]
+            st.session_state["generation_completed"] = len(st.session_state["partial_results"])
+            candidate_state = st.session_state["generation_candidates"].setdefault(candidate_id, {})
+            candidate_state.update({"status": "completed", "stage": "completed", "message": "候选方案已完成"})
+            persist_partial_generation_state()
+        elif event_type == "run_finished":
+            results = event["results"]
+            st.session_state["results"] = results
+            st.session_state["exp_mode"] = st.session_state.get("active_exp_mode", "demo_planner_critic")
+            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state["timestamp"] = timestamp_str
+            st.session_state["generation_timestamp"] = timestamp_str
+            st.session_state["generation_completed"] = len(results)
+            json_file = st.session_state.get("current_run_json_file", "")
+            images_dir = st.session_state.get("current_run_images_dir", "")
+            if json_file and images_dir:
+                st.session_state["json_file"] = json_file
+                st.session_state["images_dir"] = images_dir
+                st.session_state["generation_saved_images"] = len(list(Path(images_dir).glob("candidate_*.png")))
+            else:
+                json_filename, images_dir_path, saved_image_paths = persist_generation_results(
+                    results,
+                    st.session_state["exp_mode"],
+                )
+                st.session_state["json_file"] = str(json_filename)
+                st.session_state["images_dir"] = str(images_dir_path)
+                st.session_state["generation_saved_images"] = len(saved_image_paths)
+            st.session_state["generation_status"] = "completed"
+        elif event_type == "run_failed":
+            st.session_state["generation_status"] = "failed"
+            st.session_state["generation_error"] = event.get("error", "未知错误")
+        elif event_type == "worker_done":
+            if st.session_state.get("generation_status") == "stopping":
+                st.session_state["generation_status"] = "stopped"
+            runner_registry.pop(run_id, None)
+            st.session_state["generation_run_id"] = None
+
+
+def stop_generation_worker():
+    """请求停止后台任务。"""
+    runner_registry = get_runner_registry()
+    run_id = st.session_state.get("generation_run_id")
+    if not run_id or run_id not in runner_registry:
+        return
+    runner_registry[run_id]["stop_event"].set()
+    st.session_state["generation_status"] = "stopping"
+
+
+@st.fragment(run_every=1)
+def render_generation_progress(current_mode):
+    """实时渲染后台任务进度。"""
+    consume_generation_events()
+    status = st.session_state.get("generation_status", "idle")
+    total = st.session_state.get("generation_total", 0)
+    completed = st.session_state.get("generation_completed", 0)
+
+    if status not in {"running", "stopping", "completed", "failed", "stopped"}:
+        return
+
+    st.divider()
+    st.markdown("## ⏱️ 生成进度")
+
+    progress_ratio = (completed / total) if total else 0.0
+    st.progress(progress_ratio, text=f"{completed}/{total} 个候选方案已完成")
+
+    status_text = {
+        "running": "正在生成中",
+        "stopping": "正在停止，当前步骤结束后会退出",
+        "completed": "生成完成",
+        "failed": "生成失败",
+        "stopped": "已停止",
+    }[status]
+    st.caption(status_text)
+
+    if status in {"running", "stopping"}:
+        if st.button("⏹️ 停止生成", type="secondary", width="stretch"):
+            stop_generation_worker()
+
+    if status == "failed" and st.session_state.get("generation_error"):
+        st.error(st.session_state["generation_error"])
+
+    if status == "completed":
+        saved_images = st.session_state.get("generation_saved_images", 0)
+        st.success(f"已完成 {completed} 个候选方案，并自动保存 {saved_images} 张图片。")
+    elif status == "stopped":
+        st.warning(f"任务已停止，已完成 {completed} / {total} 个候选方案。")
+
+    candidate_states = st.session_state.get("generation_candidates", {})
+    partial_results = st.session_state.get("partial_results", {})
+    if total:
+        cols = st.columns(3)
+        for idx in range(total):
+            with cols[idx % 3]:
+                state = candidate_states.get(idx, {"status": "queued", "stage": "queued", "message": "等待处理"})
+                with st.expander(f"候选 {idx} | {state['status']}", expanded=state["status"] in {"running", "error"}):
+                    st.caption(f"阶段：{state.get('stage', 'queued')}")
+                    st.write(state.get("message", ""))
+                    prompts = state.get("prompts", [])
+                    if prompts:
+                        for prompt_idx, prompt in enumerate(prompts):
+                            with st.expander(f"提示词 {prompt_idx + 1} | {prompt.get('stage', '')}", expanded=(prompt_idx == len(prompts) - 1)):
+                                st.code(clean_text(prompt.get("text", "")), language="markdown")
+                    if idx in partial_results:
+                        display_candidate_result(partial_results[idx], idx, current_mode)
+
+async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K", api_key="", provider="openai_compatible", base_url=""):
     """
-    使用图像编辑 API 精修图像，支持 Evolink 和 Gemini 两种 Provider。
+    使用图像编辑 API 精修图像，支持 OpenAI-compatible 和 Google-compatible 两种 Provider。
 
     参数：
         image_bytes: 图像字节数据
@@ -191,21 +653,22 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
         aspect_ratio: 输出宽高比 (21:9, 16:9, 3:2)
         image_size: 输出分辨率 (2K 或 4K)
         api_key: API 密钥
-        provider: "evolink" 或 "gemini"
+        provider: "openai_compatible" 或 "google_compatible"
 
     返回：
         元组 (编辑后的图像字节数据, 成功消息)
     """
     try:
-        from utils import generation_utils
+        runtime_clients = generation_utils.create_runtime_clients(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+        )
 
-        if provider == "gemini":
-            # ====== Gemini 路径：多模态 API，直接传图片字节 ======
-            if api_key:
-                generation_utils.init_gemini_client(api_key)
-
-            if generation_utils.gemini_client is None:
-                return None, "❌ Gemini Client 未初始化，请在侧边栏填入 Google API Key。"
+        if provider == "google_compatible":
+            # ====== Google-compatible 路径：多模态 API，直接传图片字节 ======
+            if runtime_clients.gemini_client is None:
+                return None, "❌ Google-compatible Client 未初始化，请在侧边栏填入图像 API Key。"
 
             from google.genai import types
 
@@ -225,7 +688,7 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
 
             image_model = st.session_state.get("tab1_image_model_name", "gemini-2.0-flash-preview-image-generation")
             response = await asyncio.to_thread(
-                generation_utils.gemini_client.models.generate_content,
+                runtime_clients.gemini_client.models.generate_content,
                 model=image_model,
                 contents=contents,
                 config=config,
@@ -240,25 +703,26 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
                         elif isinstance(edited_image_data, str):
                             return base64.b64decode(edited_image_data), "✅ 图像精修成功！"
 
-            return None, "❌ Gemini 未返回图像数据"
+            return None, "❌ Google-compatible 接口未返回图像数据"
 
         else:
-            # ====== Evolink 路径：上传图片获取 URL → image_urls ======
-            if api_key:
-                generation_utils.init_evolink_provider(api_key)
-
-            if generation_utils.evolink_provider is None:
-                return None, "❌ Evolink Provider 未初始化，请在侧边栏填入 API Key。"
+            # ====== OpenAI-compatible 路径：上传图片获取 URL → image_urls ======
+            if runtime_clients.evolink_provider is None:
+                return None, "❌ OpenAI-compatible Provider 未初始化，请在侧边栏填入图像 API Key。"
 
             image_model = st.session_state.get("tab1_image_model_name", "nano-banana-2-lite")
 
-            # 步骤 1：上传原始图片到 Evolink 文件服务
+            # 步骤 1：上传原始图片到文件服务
             image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-            ref_image_url = await generation_utils.upload_image_to_evolink(image_b64, media_type="image/jpeg")
+            ref_image_url = await generation_utils.upload_image_to_evolink(
+                image_b64,
+                media_type="image/jpeg",
+                runtime_clients=runtime_clients,
+            )
             print(f"[精修] 参考图已上传: {ref_image_url[:80]}...")
 
             # 步骤 2：图像生成 API（传入参考图 URL）
-            result = await generation_utils.evolink_provider.generate_image(
+            result = await runtime_clients.evolink_provider.generate_image(
                 model_name=image_model,
                 prompt=edit_prompt,
                 aspect_ratio=aspect_ratio,
@@ -276,6 +740,8 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
 
     except Exception as e:
         return None, f"❌ 错误：{str(e)}"
+    finally:
+        await generation_utils.close_runtime_clients(locals().get("runtime_clients"))
 
 
 def get_evolution_stages(result, exp_mode):
@@ -326,6 +792,21 @@ def get_evolution_stages(result, exp_mode):
 def display_candidate_result(result, candidate_id, exp_mode):
     """展示单个候选方案的结果。"""
     task_name = "diagram"
+    if result.get("_prompt_only"):
+        st.info(f"候选方案 {candidate_id}（仅提示词）")
+        prompt_keys = [
+            ("规划器", f"target_{task_name}_desc0"),
+            ("风格化器", f"target_{task_name}_stylist_desc0"),
+        ]
+        shown = False
+        for label, key in prompt_keys:
+            if key in result and result[key]:
+                shown = True
+                with st.expander(f"📝 {label}提示词", expanded=(label == "规划器")):
+                    st.code(clean_text(result[key]), language="markdown")
+        if not shown:
+            st.info("暂无提示词内容")
+        return
 
     # 根据 exp_mode 决定展示哪张图像
     # 对于演示模式，始终尝试查找最后一轮评审结果
@@ -355,7 +836,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
     if final_image_key and final_image_key in result:
         img = base64_to_image(result[final_image_key])
         if img:
-            st.image(img, use_container_width=True, caption=f"候选方案 {candidate_id}（最终版）")
+            st.image(img, width="stretch", caption=f"候选方案 {candidate_id}（最终版）")
 
             # 添加下载按钮
             buffered = BytesIO()
@@ -366,7 +847,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 file_name=f"candidate_{candidate_id}.png",
                 mime="image/png",
                 key=f"download_candidate_{candidate_id}",
-                use_container_width=True
+                width="stretch"
             )
         else:
             st.error(f"候选方案 {candidate_id} 的图像解码失败")
@@ -386,7 +867,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 # 展示该阶段的图像
                 stage_img = base64_to_image(result.get(stage['image_key']))
                 if stage_img:
-                    st.image(stage_img, use_container_width=True)
+                    st.image(stage_img, width="stretch")
 
                 # 展示描述
                 if stage['desc_key'] in result:
@@ -418,6 +899,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 st.info("暂无描述")
 
 def main():
+    init_generation_state()
     st.title("🍌 PaperVizAgent 演示")
     st.markdown("AI 驱动的科学图表生成与精修")
 
@@ -494,72 +976,256 @@ def main():
             )
 
             # Provider 选择
-            provider = st.selectbox(
-                "API Provider",
-                ["gemini", "evolink"],
-                index=0,
-                key="tab1_provider",
-                help="gemini：Google 官方 API（需翻墙）| evolink：国内代理"
+            provider_options = ["openai_compatible", "google_compatible"]
+            default_text_provider = get_config_val("ui_defaults", "text_provider", "UI_DEFAULT_TEXT_PROVIDER", "openai_compatible")
+            default_image_provider = get_config_val("ui_defaults", "image_provider", "UI_DEFAULT_IMAGE_PROVIDER", "openai_compatible")
+            if "tab1_text_provider" not in st.session_state:
+                st.session_state["tab1_text_provider"] = default_text_provider if default_text_provider in provider_options else provider_options[0]
+            if "tab1_image_provider" not in st.session_state:
+                st.session_state["tab1_image_provider"] = default_image_provider if default_image_provider in provider_options else provider_options[0]
+
+            text_provider = st.selectbox(
+                    "文本 Provider",
+                    provider_options,
+                    key="tab1_text_provider",
+                    help="用于检索、规划、风格化、评审的文本模型提供商"
+                )
+
+            image_provider = st.selectbox(
+                    "图像 Provider",
+                    provider_options,
+                    key="tab1_image_provider",
+                    help="用于出图和精修的图像模型提供商"
             )
 
-            # Provider 对应的默认配置
-            _provider_defaults = {
-                "evolink": {
-                    "api_key_label": "API Key",
-                    "api_key_help": "Evolink API 密钥（Bearer Token）",
-                    "api_key_default": get_config_val("evolink", "api_key", "EVOLINK_API_KEY", ""),
-                    "model_name": "gemini-2.5-flash",
-                    "image_model_name": "nano-banana-2-lite",
+            # 文本 Provider 对应的默认配置
+            _text_provider_defaults = {
+                "openai_compatible": {
+                    "api_key_label": "文本 API Key",
+                    "api_key_help": "OpenAI 兼容接口的 API 密钥",
+                    "api_key_default": get_config_val("openai_compatible", "text_api_key", "OPENAI_COMPATIBLE_TEXT_API_KEY", get_config_val("openai_compatible", "api_key", "OPENAI_COMPATIBLE_API_KEY", get_config_val("evolink", "api_key", "EVOLINK_API_KEY", ""))),
+                    "base_url_default": get_config_val("openai_compatible", "text_base_url", "OPENAI_COMPATIBLE_TEXT_BASE_URL", get_config_val("openai_compatible", "base_url", "OPENAI_COMPATIBLE_BASE_URL", "https://cliproxy.bingot.codes")),
+                    "model_name": get_config_val("defaults", "model_name", "MODEL_NAME", "gpt-5.4"),
                 },
-                "gemini": {
-                    "api_key_label": "Google API Key",
-                    "api_key_help": "Google AI Studio API 密钥",
-                    "api_key_default": get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", ""),
-                    "model_name": "gemini-2.5-flash-preview-05-20",
-                    "image_model_name": "gemini-2.0-flash-preview-image-generation",
+                "google_compatible": {
+                    "api_key_label": "文本 Google-Compatible API Key",
+                    "api_key_help": "Google 兼容接口的 API 密钥",
+                    "api_key_default": get_config_val("google_compatible", "text_api_key", "GOOGLE_COMPATIBLE_TEXT_API_KEY", get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "")),
+                    "base_url_default": get_config_val("google_compatible", "base_url", "GOOGLE_COMPATIBLE_BASE_URL", get_config_val("gemini", "base_url", "GEMINI_BASE_URL", "")),
+                    "model_name": get_config_val("defaults", "model_name", "MODEL_NAME", "gemini-2.5-flash-preview-05-20"),
                 },
             }
-            _pd = _provider_defaults[provider]
+            _tpd = _text_provider_defaults[text_provider]
+
+            # 图像 Provider 对应的默认配置
+            _provider_defaults = {
+                "openai_compatible": {
+                    "api_key_label": "图像 API Key",
+                    "api_key_help": "OpenAI 兼容接口的 API 密钥",
+                    "api_key_default": get_config_val("openai_compatible", "image_api_key", "OPENAI_COMPATIBLE_IMAGE_API_KEY", get_config_val("openai_compatible", "api_key", "OPENAI_COMPATIBLE_API_KEY", get_config_val("evolink", "api_key", "EVOLINK_API_KEY", ""))),
+                    "base_url_default": get_config_val("openai_compatible", "image_base_url", "OPENAI_COMPATIBLE_IMAGE_BASE_URL", get_config_val("openai_compatible", "base_url", "OPENAI_COMPATIBLE_BASE_URL", "http://155.94.132.145:38000")),
+                    "image_model_name": get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "nano-banana-2-lite"),
+                },
+                "google_compatible": {
+                    "api_key_label": "图像 Google-Compatible API Key",
+                    "api_key_help": "Google 兼容接口的 API 密钥",
+                    "api_key_default": get_config_val("google_compatible", "image_api_key", "GOOGLE_COMPATIBLE_IMAGE_API_KEY", get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "")),
+                    "base_url_default": get_config_val("google_compatible", "base_url", "GOOGLE_COMPATIBLE_BASE_URL", get_config_val("gemini", "base_url", "GEMINI_BASE_URL", "")),
+                    "image_model_name": get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "gemini-2.0-flash-preview-image-generation"),
+                },
+            }
+            _ipd = _provider_defaults[image_provider]
 
             # 首次加载时设置默认值
-            if "tab1_api_key" not in st.session_state:
-                st.session_state["tab1_api_key"] = _pd["api_key_default"]
+            if "tab1_text_api_key" not in st.session_state:
+                st.session_state["tab1_text_api_key"] = _tpd["api_key_default"]
             if "tab1_model_name" not in st.session_state:
-                st.session_state["tab1_model_name"] = _pd["model_name"]
+                st.session_state["tab1_model_name"] = _tpd["model_name"]
+            if "tab1_text_base_url" not in st.session_state:
+                st.session_state["tab1_text_base_url"] = _tpd["base_url_default"]
+            if "tab1_image_api_key" not in st.session_state:
+                st.session_state["tab1_image_api_key"] = _ipd["api_key_default"]
             if "tab1_image_model_name" not in st.session_state:
-                st.session_state["tab1_image_model_name"] = _pd["image_model_name"]
+                st.session_state["tab1_image_model_name"] = _ipd["image_model_name"]
+            if "tab1_image_base_url" not in st.session_state:
+                st.session_state["tab1_image_base_url"] = _ipd["base_url_default"]
 
-            # 检测 provider 切换，重置模型名称
-            if "prev_provider" not in st.session_state:
-                st.session_state["prev_provider"] = provider
-            if st.session_state["prev_provider"] != provider:
-                st.session_state["prev_provider"] = provider
-                st.session_state["tab1_model_name"] = _pd["model_name"]
-                st.session_state["tab1_image_model_name"] = _pd["image_model_name"]
-                st.session_state["tab1_api_key"] = _pd["api_key_default"]
+            # 检测文本 provider 切换
+            if "prev_text_provider" not in st.session_state:
+                st.session_state["prev_text_provider"] = text_provider
+            if st.session_state["prev_text_provider"] != text_provider:
+                st.session_state["prev_text_provider"] = text_provider
+                st.session_state["tab1_model_name"] = _tpd["model_name"]
+                st.session_state["tab1_text_api_key"] = _tpd["api_key_default"]
+                st.session_state["tab1_text_base_url"] = _tpd["base_url_default"]
                 st.rerun()
 
-            # API Key
-            api_key = st.text_input(
-                _pd["api_key_label"],
+            # 检测图像 provider 切换
+            if "prev_image_provider" not in st.session_state:
+                st.session_state["prev_image_provider"] = image_provider
+            if st.session_state["prev_image_provider"] != image_provider:
+                st.session_state["prev_image_provider"] = image_provider
+                st.session_state["tab1_image_model_name"] = _ipd["image_model_name"]
+                st.session_state["tab1_image_api_key"] = _ipd["api_key_default"]
+                st.session_state["tab1_image_base_url"] = _ipd["base_url_default"]
+                st.rerun()
+
+            # 文本 API Key
+            text_api_key = st.text_input(
+                _tpd["api_key_label"],
                 type="password",
-                key="tab1_api_key",
-                help=_pd["api_key_help"]
+                key="tab1_text_api_key",
+                help=_tpd["api_key_help"]
             )
 
-            # 文本模型
-            model_name = st.text_input(
-                "文本模型",
-                key="tab1_model_name",
-                help="用于推理/规划/评审的模型名称"
+            text_base_url = st.text_input(
+                "文本 API 代理站点",
+                key="tab1_text_base_url",
+                help="用于文本模型请求的 Base URL / 代理地址。",
             )
 
-            # 图像模型
-            image_model_name = st.text_input(
-                "图像模型",
-                key="tab1_image_model_name",
-                help="用于图像生成的模型名称"
+            text_models_cache_key = f"text_models::{text_provider}::{text_base_url}::{text_api_key}"
+            if st.button("读取文本模型列表", width="stretch"):
+                if text_provider != "openai_compatible":
+                    st.info("当前仅对 openai_compatible 站点读取 /v1/models。")
+                else:
+                    try:
+                        st.session_state[text_models_cache_key] = filter_model_ids(
+                            fetch_openai_compatible_models(text_base_url, text_api_key),
+                            usage="text",
+                        )
+                        st.success(f"已读取 {len(st.session_state[text_models_cache_key])} 个文本模型")
+                    except urllib_error.HTTPError as e:
+                        st.error(f"读取文本模型失败：HTTP {e.code}")
+                    except Exception as e:
+                        st.error(f"读取文本模型失败：{e}")
+
+            text_model_options = st.session_state.get(text_models_cache_key, [])
+            if text_model_options:
+                current_text_model = st.session_state.get("tab1_model_name", _tpd["model_name"])
+                if current_text_model not in text_model_options:
+                    text_model_options = [current_text_model] + text_model_options
+                model_name = st.selectbox(
+                    "文本模型",
+                    options=text_model_options,
+                    index=text_model_options.index(current_text_model),
+                    key="tab1_model_name_select",
+                    help="用于推理/规划/评审的模型名称",
+                )
+                st.session_state["tab1_model_name"] = model_name
+            else:
+                model_name = st.text_input(
+                    "文本模型",
+                    key="tab1_model_name",
+                    help="用于推理/规划/评审的模型名称",
+                )
+
+            st.caption("图像链路单独配置，不会复用文本 provider。")
+
+            image_api_key = st.text_input(
+                _ipd["api_key_label"],
+                type="password",
+                key="tab1_image_api_key",
+                help=_ipd["api_key_help"]
             )
+
+            image_base_url = st.text_input(
+                "图像 API 代理站点",
+                key="tab1_image_base_url",
+                help="用于图像模型请求的 Base URL / 代理地址。",
+            )
+
+            image_models_cache_key = f"image_models::{image_provider}::{image_base_url}::{image_api_key}"
+            if st.button("读取图像模型列表", width="stretch"):
+                if image_provider != "openai_compatible":
+                    st.info("当前仅对 openai_compatible 站点读取 /v1/models。")
+                else:
+                    try:
+                        st.session_state[image_models_cache_key] = filter_model_ids(
+                            fetch_openai_compatible_models(image_base_url, image_api_key),
+                            usage="image",
+                        )
+                        st.success(f"已读取 {len(st.session_state[image_models_cache_key])} 个图像模型")
+                    except urllib_error.HTTPError as e:
+                        st.error(f"读取图像模型失败：HTTP {e.code}")
+                    except Exception as e:
+                        st.error(f"读取图像模型失败：{e}")
+
+            image_model_options = st.session_state.get(image_models_cache_key, [])
+            if image_model_options:
+                current_image_model = st.session_state.get("tab1_image_model_name", _ipd["image_model_name"])
+                if current_image_model not in image_model_options:
+                    image_model_options = [current_image_model] + image_model_options
+                image_model_name = st.selectbox(
+                    "图像模型",
+                    options=image_model_options,
+                    index=image_model_options.index(current_image_model),
+                    key="tab1_image_model_name_select",
+                    help="用于图像生成的模型名称",
+                )
+                st.session_state["tab1_image_model_name"] = image_model_name
+            else:
+                image_model_name = st.text_input(
+                    "图像模型",
+                    key="tab1_image_model_name",
+                    help="用于图像生成的模型名称",
+                )
+
+            if st.button("💾 设为默认配置", width="stretch"):
+                try:
+                    save_current_settings_to_config(
+                        text_provider=text_provider,
+                        text_api_key=text_api_key,
+                        text_base_url=text_base_url,
+                        model_name=model_name,
+                        image_provider=image_provider,
+                        image_api_key=image_api_key,
+                        image_base_url=image_base_url,
+                        image_model_name=image_model_name,
+                    )
+                    st.success("当前 Provider、API、Key 和模型已保存为默认配置。")
+                except Exception as e:
+                    st.error(f"保存默认配置失败：{e}")
+
+            st.divider()
+            st.markdown("### 🕘 历史记录")
+
+            history_files = list_history_json_files()
+            history_options = [""] + [str(path) for path in history_files]
+            history_labels = {"": "选择历史记录..."}
+            history_labels.update({str(path): format_history_label(path) for path in history_files})
+
+            selected_history = st.selectbox(
+                "历史 JSON",
+                options=history_options,
+                key="history_json_selector",
+                format_func=lambda value: history_labels.get(value, value),
+                help="从 results/demo 中选择一份历史结果",
+            )
+
+            col_history1, col_history2 = st.columns(2)
+            with col_history1:
+                if st.button("加载历史", width="stretch"):
+                    if not selected_history:
+                        st.warning("请先选择一份历史记录。")
+                    else:
+                        history_path = Path(selected_history)
+                        try:
+                            loaded_results = load_history_results(history_path)
+                            st.session_state["results"] = loaded_results
+                            st.session_state["json_file"] = str(history_path)
+                            st.session_state["images_dir"] = str(history_path.with_suffix(""))
+                            st.session_state["exp_mode"] = infer_exp_mode_from_results(loaded_results)
+                            st.session_state["timestamp"] = datetime.fromtimestamp(history_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                            st.success(f"已加载历史记录：{history_path.name}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"加载历史记录失败：{e}")
+            with col_history2:
+                if st.button("清空结果", width="stretch"):
+                    for key in ["results", "json_file", "images_dir", "exp_mode", "timestamp"]:
+                        st.session_state.pop(key, None)
+                    st.rerun()
 
         st.divider()
 
@@ -666,74 +1332,65 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
             )
 
         # 处理按钮
-        if st.button("🚀 生成候选方案", type="primary", use_container_width=True):
+        col_run1, col_run2 = st.columns(2)
+        start_generate = col_run1.button("🚀 生成候选方案", type="primary", width="stretch")
+        start_prompt_only = col_run2.button("📝 只生成提示词", width="stretch")
+
+        if start_generate or start_prompt_only:
             if not method_content or not caption:
                 st.error("请同时提供方法内容和图注！")
+            elif st.session_state.get("generation_status") in {"running", "stopping"}:
+                st.warning("当前已有生成任务在运行，请先等待完成或停止。")
             else:
                 # 保存到会话状态
                 st.session_state["method_content"] = method_content
                 st.session_state["caption"] = caption
+                reset_generation_state(clear_results=True)
+                init_current_run_output_paths()
+                st.session_state["active_exp_mode"] = exp_mode
+                st.session_state["generation_total"] = num_candidates
+                st.session_state["generation_candidates"] = build_candidate_state(num_candidates)
+                st.session_state["generation_prompt_only"] = bool(start_prompt_only)
 
-                with st.spinner(f"正在并行生成 {num_candidates} 个候选方案... 这可能需要几分钟。"):
-                    # 创建输入数据列表
-                    input_data_list = create_sample_inputs(
-                        method_content=method_content,
-                        caption=caption,
-                        aspect_ratio=aspect_ratio,
-                        num_copies=num_candidates,
-                        max_critic_rounds=max_critic_rounds
-                    )
+                input_data_list = create_sample_inputs(
+                    method_content=method_content,
+                    caption=caption,
+                    aspect_ratio=aspect_ratio,
+                    num_copies=num_candidates,
+                    max_critic_rounds=max_critic_rounds
+                )
 
-                    # 并行处理
-                    try:
-                        results = asyncio.run(process_parallel_candidates(
-                            input_data_list,
-                            exp_mode=exp_mode,
-                            retrieval_setting=retrieval_setting,
-                            model_name=model_name,
-                            image_model_name=image_model_name,
-                            provider=provider,
-                            api_key=api_key
-                        ))
-                        st.session_state["results"] = results
-                        st.session_state["exp_mode"] = exp_mode
-                        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        st.session_state["timestamp"] = timestamp_str
+                run_id = launch_generation_worker(
+                    {
+                        "data_list": input_data_list,
+                        "exp_mode": exp_mode,
+                        "retrieval_setting": retrieval_setting,
+                        "model_name": model_name,
+                        "image_model_name": image_model_name,
+                        "text_provider": text_provider,
+                        "text_api_key": text_api_key,
+                        "text_base_url": text_base_url,
+                        "image_provider": image_provider,
+                        "image_api_key": image_api_key,
+                        "image_base_url": image_base_url,
+                        "prompt_only": bool(start_prompt_only),
+                    }
+                )
+                st.session_state["generation_run_id"] = run_id
+                st.session_state["generation_status"] = "running"
+                st.rerun()
 
-                        # 将结果保存为 JSON 文件
-                        try:
-                            # 如果结果目录不存在则创建
-                            results_dir = Path(__file__).parent / "results" / "demo"
-                            results_dir.mkdir(parents=True, exist_ok=True)
-
-                            # 生成带时间戳的文件名
-                            json_filename = results_dir / f"demo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-
-                            # 保存为 JSON 并正确处理编码（与 main.py 一致）
-                            with open(json_filename, "w", encoding="utf-8", errors="surrogateescape") as f:
-                                json_string = json.dumps(results, ensure_ascii=False, indent=4)
-                                # 清理无效的 UTF-8 字符
-                                json_string = json_string.encode("utf-8", "ignore").decode("utf-8")
-                                f.write(json_string)
-
-                            st.session_state["json_file"] = str(json_filename)
-                            st.success(f"✅ 成功生成 {len(results)} 个候选方案！")
-                            st.info(f"💾 结果已保存至：`{json_filename.name}`")
-                        except Exception as e:
-                            st.warning(f"⚠️ 已生成 {len(results)} 个候选方案，但 JSON 保存失败：{e}")
-                    except Exception as e:
-                        st.error(f"处理过程中出错：{e}")
-                        import traceback
-                        st.code(traceback.format_exc())
+        render_generation_progress(exp_mode)
 
         # 展示结果
         if "results" in st.session_state and st.session_state["results"]:
             results = st.session_state["results"]
             current_mode = st.session_state.get("exp_mode", exp_mode)
             timestamp = st.session_state.get("timestamp", "N/A")
+            prompt_only_mode = st.session_state.get("generation_prompt_only", False)
 
             st.divider()
-            st.markdown("## 🎨 已生成的候选方案")
+            st.markdown("## 🎨 已生成的候选方案" if not prompt_only_mode else "## 📝 已生成的提示词方案")
             st.caption(f"生成时间：{timestamp} | 流水线：{mode_info.get(current_mode, current_mode)}")
 
             # 如果有 JSON 文件则显示下载按钮
@@ -751,8 +1408,13 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                             data=json_data,
                             file_name=json_file_path.name,
                             mime="application/json",
-                            use_container_width=True
+                            width="stretch"
                         )
+
+            if "images_dir" in st.session_state:
+                images_dir_path = Path(st.session_state["images_dir"])
+                if images_dir_path.exists():
+                    st.info(f"🖼️ 图片已自动保存至：`{images_dir_path.relative_to(Path.cwd())}`")
 
             # 以网格形式展示结果（3 列）
             num_cols = 3
@@ -766,57 +1428,58 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         with cols[col_idx]:
                             display_candidate_result(results[result_idx], result_idx, current_mode)
 
-            # 添加 ZIP 下载按钮
-            st.divider()
-            st.markdown("### 💾 批量下载")
+            if not prompt_only_mode:
+                # 添加 ZIP 下载按钮
+                st.divider()
+                st.markdown("### 💾 批量下载")
 
-            try:
-                import zipfile
+                try:
+                    import zipfile
 
-                zip_buffer = BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                    task_name = "diagram"
+                    zip_buffer = BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                        task_name = "diagram"
 
-                    for candidate_id, result in enumerate(results):
+                        for candidate_id, result in enumerate(results):
 
-                        # 查找最终图像键（逻辑与展示一致）
-                        final_image_key = None
+                            # 查找最终图像键（逻辑与展示一致）
+                            final_image_key = None
 
-                        # 尝试查找最后一轮评审
-                        for round_idx in range(3, -1, -1):
-                            image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
-                            if image_key in result and result[image_key]:
-                                final_image_key = image_key
-                                break
+                            # 尝试查找最后一轮评审
+                            for round_idx in range(3, -1, -1):
+                                image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
+                                if image_key in result and result[image_key]:
+                                    final_image_key = image_key
+                                    break
 
-                        # 如果没有完成评审轮次则使用备选方案
-                        if not final_image_key:
-                            if current_mode == "demo_full":
-                                final_image_key = f"target_{task_name}_stylist_desc0_base64_jpg"
-                            else:
-                                final_image_key = f"target_{task_name}_desc0_base64_jpg"
+                            # 如果没有完成评审轮次则使用备选方案
+                            if not final_image_key:
+                                if current_mode == "demo_full":
+                                    final_image_key = f"target_{task_name}_stylist_desc0_base64_jpg"
+                                else:
+                                    final_image_key = f"target_{task_name}_desc0_base64_jpg"
 
-                        if final_image_key and final_image_key in result:
-                            img = base64_to_image(result[final_image_key])
-                            if img:
-                                img_buffer = BytesIO()
-                                img.save(img_buffer, format="PNG")
-                                zip_file.writestr(
-                                    f"candidate_{candidate_id}.png",
-                                    img_buffer.getvalue()
-                                )
+                            if final_image_key and final_image_key in result:
+                                img = base64_to_image(result[final_image_key])
+                                if img:
+                                    img_buffer = BytesIO()
+                                    img.save(img_buffer, format="PNG")
+                                    zip_file.writestr(
+                                        f"candidate_{candidate_id}.png",
+                                        img_buffer.getvalue()
+                                    )
 
-                zip_buffer.seek(0)
-                st.download_button(
-                    label="⬇️ 下载 ZIP 压缩包",
-                    data=zip_buffer.getvalue(),
-                    file_name=f"papervizagent_candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                    mime="application/zip",
-                    use_container_width=True
-                )
-                st.success("ZIP 压缩包已准备好，可以下载！")
-            except Exception as e:
-                st.error(f"创建 ZIP 压缩包失败：{e}")
+                    zip_buffer.seek(0)
+                    st.download_button(
+                        label="⬇️ 下载 ZIP 压缩包",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"papervizagent_candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                        mime="application/zip",
+                        width="stretch"
+                    )
+                    st.success("ZIP 压缩包已准备好，可以下载！")
+                except Exception as e:
+                    st.error(f"创建 ZIP 压缩包失败：{e}")
 
     # ==================== 选项卡 2：精修图像 ====================
     with tab2:
@@ -860,7 +1523,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
 
             with col1:
                 st.markdown("### 原始图像")
-                st.image(uploaded_image, use_container_width=True)
+                st.image(uploaded_image, width="stretch")
 
             with col2:
                 st.markdown("### 编辑指令")
@@ -872,7 +1535,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                     key="edit_prompt"
                 )
 
-                if st.button("✨ 精修图像", type="primary", use_container_width=True):
+                if st.button("✨ 精修图像", type="primary", width="stretch"):
                     if not edit_prompt:
                         st.error("请提供编辑指令！")
                     else:
@@ -890,8 +1553,9 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                                         edit_prompt=edit_prompt,
                                         aspect_ratio=refine_aspect_ratio,
                                         image_size=refine_resolution,
-                                        api_key=api_key,
-                                        provider=provider,
+                                        api_key=image_api_key,
+                                        provider=image_provider,
+                                        base_url=image_base_url,
                                     )
                                 )
 
@@ -917,12 +1581,12 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
 
                 with col1:
                     st.markdown("### 精修前")
-                    st.image(uploaded_image, use_container_width=True)
+                    st.image(uploaded_image, width="stretch")
 
                 with col2:
                     st.markdown(f"### 精修后（{refine_resolution}）")
                     refined_image = Image.open(BytesIO(st.session_state["refined_image"]))
-                    st.image(refined_image, use_container_width=True)
+                    st.image(refined_image, width="stretch")
 
                     # 下载按钮
                     st.download_button(
@@ -930,7 +1594,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         data=st.session_state["refined_image"],
                         file_name=f"refined_{refine_resolution}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                         mime="image/png",
-                        use_container_width=True
+                        width="stretch"
                     )
 
 if __name__ == "__main__":

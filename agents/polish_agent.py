@@ -75,17 +75,24 @@ class PolishAgent(BaseAgent):
         ]
 
         try:
-            if self.exp_config.provider == "evolink":
+            max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+                model_name=self.text_model_name,
+                provider=self.exp_config.text_provider,
+                runtime_clients=self.exp_config.text_runtime_clients,
+                fallback=50000,
+            )
+            if self.exp_config.text_provider == "openai_compatible":
                 response_list = await generation_utils.call_evolink_text_with_retry_async(
                     model_name=self.text_model_name,
                     contents=content_list,
                     config={
                         "system_prompt": self.suggestion_system_prompt,
                         "temperature": 1,
-                        "max_output_tokens": 50000,
+                        "max_output_tokens": max_output_tokens,
                     },
                     max_attempts=3,
                     retry_delay=10,
+                    runtime_clients=self.exp_config.text_runtime_clients,
                 )
             else:
                 from google.genai import types
@@ -96,10 +103,11 @@ class PolishAgent(BaseAgent):
                         system_instruction=self.suggestion_system_prompt,
                         temperature=1,
                         candidate_count=1,
-                        max_output_tokens=50000,
+                        max_output_tokens=max_output_tokens,
                     ),
                     max_attempts=3,
                     retry_delay=10,
+                    runtime_clients=self.exp_config.text_runtime_clients,
                 )
             return response_list[0] if response_list else ""
         except Exception as e:
@@ -159,11 +167,11 @@ class PolishAgent(BaseAgent):
         ]
 
         try:
-            if self.exp_config.provider == "evolink":
+            if self.exp_config.image_provider == "openai_compatible":
                 # Evolink 图像生成：先上传参考图获取 URL，再传给 image_urls
                 print(f"🎨 [Step 2a] 上传参考图到 Evolink 文件服务...")
                 ref_image_url = await generation_utils.upload_image_to_evolink(
-                    gt_image_b64, media_type="image/jpeg"
+                    gt_image_b64, media_type="image/jpeg", runtime_clients=self.exp_config.image_runtime_clients
                 )
                 response_list = await generation_utils.call_evolink_image_with_retry_async(
                     model_name=self.image_model_name,
@@ -175,6 +183,7 @@ class PolishAgent(BaseAgent):
                     },
                     max_attempts=5,
                     retry_delay=30,
+                    runtime_clients=self.exp_config.image_runtime_clients,
                 )
             else:
                 from google.genai import types
@@ -194,6 +203,7 @@ class PolishAgent(BaseAgent):
                     ),
                     max_attempts=5,
                     retry_delay=30,
+                    runtime_clients=self.exp_config.image_runtime_clients,
                 )
 
             if response_list and response_list[0]:

@@ -31,7 +31,8 @@ from agents.critic_agent import CriticAgent
 from agents.retriever_agent import RetrieverAgent
 from agents.polish_agent import PolishAgent
 
-from utils import config, paperviz_processor
+from utils import config, generation_utils, paperviz_processor
+from utils.result_export import export_batch_result_images
 
 
 async def main():
@@ -84,6 +85,15 @@ async def main():
     )
     args = parser.parse_args()
 
+    text_runtime_clients = generation_utils.create_runtime_clients(
+        provider="openai_compatible",
+        base_url=generation_utils.openai_compatible_text_base_url,
+    )
+    image_runtime_clients = generation_utils.create_runtime_clients(
+        provider="openai_compatible",
+        base_url=generation_utils.openai_compatible_image_base_url,
+    )
+
     exp_config = config.ExpConfig(
         dataset_name=args.dataset_name,
         task_name=args.task_name,
@@ -92,7 +102,11 @@ async def main():
         retrieval_setting=args.retrieval_setting,
         max_critic_rounds=args.max_critic_rounds,
         model_name=args.model_name,
+        text_provider="openai_compatible",
+        image_provider="openai_compatible",
         work_dir=Path(__file__).parent,
+        text_runtime_clients=text_runtime_clients,
+        image_runtime_clients=image_runtime_clients,
     )
     
     base_path = Path(__file__).parent / "data" / exp_config.dataset_name
@@ -129,19 +143,30 @@ async def main():
             json_string = json_string.encode("utf-8", "ignore").decode("utf-8")
             await f.write(json_string)
 
-    # Process samples incrementally
-    idx = 0
-    async for result_data in processor.process_queries_batch(
-        data_list, max_concurrent=concurrent_num
-    ):
-        all_result_list.append(result_data)
-        idx += 1
-        if idx % 10 == 0:
-            await save_results_and_scores(all_result_list)
+    try:
+        # Process samples incrementally
+        idx = 0
+        async for result_data in processor.process_queries_batch(
+            data_list, max_concurrent=concurrent_num
+        ):
+            all_result_list.append(result_data)
+            idx += 1
+            if idx % 10 == 0:
+                await save_results_and_scores(all_result_list)
 
-    # Final save
-    await save_results_and_scores(all_result_list)
-    print("Processing completed.")
+        # Final save
+        await save_results_and_scores(all_result_list)
+        saved_image_paths = export_batch_result_images(
+            all_result_list,
+            output_dir=output_filename.with_suffix(""),
+            task_name=exp_config.task_name,
+            exp_mode=exp_config.exp_mode,
+        )
+        print(f"Saved {len(saved_image_paths)} images to {output_filename.with_suffix('')}")
+        print("Processing completed.")
+    finally:
+        await generation_utils.close_runtime_clients(text_runtime_clients)
+        await generation_utils.close_runtime_clients(image_runtime_clients)
 
 
 if __name__ == "__main__":

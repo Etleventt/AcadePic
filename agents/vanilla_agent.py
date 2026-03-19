@@ -115,7 +115,16 @@ class VanillaAgent(BaseAgent):
         content_list = [{"type": "text", "text": prompt_text}]
 
         # 根据 provider 路由 API 调用
-        if self.exp_config.provider == "evolink":
+        provider_name = self.exp_config.image_provider if cfg["use_image_generation"] else self.exp_config.text_provider
+        runtime_clients = self.exp_config.image_runtime_clients if cfg["use_image_generation"] else self.exp_config.text_runtime_clients
+        max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+            model_name=self.model_name if not cfg["use_image_generation"] else self.exp_config.model_name,
+            provider=provider_name if not cfg["use_image_generation"] else self.exp_config.text_provider,
+            runtime_clients=runtime_clients if not cfg["use_image_generation"] else self.exp_config.text_runtime_clients,
+            fallback=50000,
+        )
+
+        if provider_name == "openai_compatible":
             if cfg["use_image_generation"]:
                 aspect_ratio = data.get("additional_info", {}).get("rounded_ratio", "1:1")
                 response_list = await generation_utils.call_evolink_image_with_retry_async(
@@ -127,6 +136,7 @@ class VanillaAgent(BaseAgent):
                     },
                     max_attempts=5,
                     retry_delay=30,
+                    runtime_clients=runtime_clients,
                 )
             else:
                 response_list = await generation_utils.call_evolink_text_with_retry_async(
@@ -135,18 +145,19 @@ class VanillaAgent(BaseAgent):
                     config={
                         "system_prompt": self.system_prompt,
                         "temperature": self.exp_config.temperature,
-                        "max_output_tokens": 50000,
+                        "max_output_tokens": max_output_tokens,
                     },
                     max_attempts=5,
                     retry_delay=30,
+                    runtime_clients=runtime_clients,
                 )
-        elif "gemini" in self.model_name:
+        elif provider_name == "google_compatible":
             from google.genai import types
             gen_config_args = {
                 "system_instruction": self.system_prompt,
                 "temperature": self.exp_config.temperature,
                 "candidate_count": 1,
-                "max_output_tokens": 50000,
+                "max_output_tokens": max_output_tokens,
             }
             if cfg["use_image_generation"]:
                 gen_config_args["response_modalities"] = ["IMAGE"]
@@ -160,6 +171,7 @@ class VanillaAgent(BaseAgent):
                 config=types.GenerateContentConfig(**gen_config_args),
                 max_attempts=5,
                 retry_delay=30,
+                runtime_clients=runtime_clients,
             )
         elif "gpt-image" in self.model_name:
             image_config = {
@@ -174,6 +186,7 @@ class VanillaAgent(BaseAgent):
                 config=image_config,
                 max_attempts=5,
                 retry_delay=30,
+                runtime_clients=runtime_clients,
             )
         else:
             raise ValueError(f"Unsupported model: {self.model_name}")

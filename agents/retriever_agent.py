@@ -58,7 +58,7 @@ class RetrieverAgent(BaseAgent):
 
     async def process(self, data: Dict[str, Any], retrieval_setting: str = "auto") -> Dict[str, Any]:
         cfg = self.task_config
-        print(f"[DEBUG] [RetrieverAgent] 开始处理, setting={retrieval_setting}, task={cfg['task_name']}, provider={self.exp_config.provider}")
+        print(f"[DEBUG] [RetrieverAgent] 开始处理, setting={retrieval_setting}, task={cfg['task_name']}, provider={self.exp_config.text_provider}")
 
         import os
         ref_file = self.exp_config.work_dir / f"data/PaperBananaBench/{cfg['task_name']}/ref.json"
@@ -156,17 +156,24 @@ class RetrieverAgent(BaseAgent):
         print(f"[DEBUG] [RetrieverAgent] auto 检索 prompt: {prompt_chars:,} 字符 (~{prompt_chars//4:,} tokens), lite={lite}")
 
         # 根据 provider 路由 API 调用
-        if self.exp_config.provider == "evolink":
+        max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+            model_name=self.model_name,
+            provider=self.exp_config.text_provider,
+            runtime_clients=self.exp_config.text_runtime_clients,
+            fallback=50000,
+        )
+        if self.exp_config.text_provider == "openai_compatible":
             response_list = await generation_utils.call_evolink_text_with_retry_async(
                 model_name=self.model_name,
                 contents=content_list,
                 config={
                     "system_prompt": self.system_prompt,
                     "temperature": self.exp_config.temperature,
-                    "max_output_tokens": 50000,
+                    "max_output_tokens": max_output_tokens,
                 },
                 max_attempts=3,
                 retry_delay=30,
+                runtime_clients=self.exp_config.text_runtime_clients,
             )
         else:
             from google.genai import types
@@ -177,10 +184,11 @@ class RetrieverAgent(BaseAgent):
                     system_instruction=self.system_prompt,
                     temperature=self.exp_config.temperature,
                     candidate_count=1,
-                    max_output_tokens=50000,
+                    max_output_tokens=max_output_tokens,
                 ),
                 max_attempts=3,
                 retry_delay=30,
+                runtime_clients=self.exp_config.text_runtime_clients,
             )
 
         raw_response = response_list[0].strip()
