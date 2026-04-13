@@ -26,6 +26,13 @@ from agents.visualizer_agent import VisualizerAgent, _execute_plot_code_worker
 from utils import generation_utils
 from utils.config import ExpConfig
 from utils.image_utils import base64_to_image, save_base64_image_as_png
+from utils.style_reference import (
+    build_style_reference_prompt_summary,
+    normalize_style_reference_image,
+    normalize_style_reference_mode,
+    resolve_style_reference_targets,
+    strip_style_reference_fields,
+)
 
 
 APP_ROOT = Path(__file__).parent
@@ -572,6 +579,9 @@ def load_default_config() -> dict[str, Any]:
         "task_type": ui_cfg.get("task_type", "diagram"),
         "text_provider": ui_cfg.get("text_provider", "openai_compatible"),
         "image_provider": ui_cfg.get("image_provider", "openai_compatible"),
+        "style_reference_mode": normalize_style_reference_mode(
+            ui_cfg.get("style_reference_mode", "stylist_only")
+        ),
         "text_api_key": openai_cfg.get("text_api_key") or openai_cfg.get("api_key") or api_keys_cfg.get("google_api_key", ""),
         "text_base_url": openai_cfg.get("text_base_url", ""),
         "text_model": defaults_cfg.get("model_name", "gpt-5.4"),
@@ -632,27 +642,56 @@ def build_exp_config(
     return exp_config, text_runtime_clients, image_runtime_clients
 
 
-def planner_user_prompt(method_text: str, caption: str, task_type: str) -> str:
+def planner_user_prompt(
+    method_text: str,
+    caption: str,
+    task_type: str,
+    *,
+    style_reference_mode: str = "off",
+    has_style_reference_image: bool = False,
+) -> str:
     meta = get_task_meta(task_type)
-    return (
+    prompt = (
         f"Now, based on the following {meta['content_label'].lower()} and {meta['intent_label'].lower()}, provide a detailed description for the "
         "figure to be generated.\n"
         f"{meta['content_label']}: {method_text}\n"
         f"{meta['intent_label']}: {caption}\n"
         f"Detailed description of the target figure to be generated{meta['desc_output_suffix']}"
     )
+    use_in_planner, _ = resolve_style_reference_targets(
+        style_reference_mode,
+        has_style_reference_image,
+    )
+    if use_in_planner:
+        prompt += f"\n{build_style_reference_prompt_summary('planner')}"
+    return prompt
 
 
-def stylist_user_prompt(planner_description: str, method_text: str, caption: str, task_type: str) -> str:
+def stylist_user_prompt(
+    planner_description: str,
+    method_text: str,
+    caption: str,
+    task_type: str,
+    *,
+    style_reference_mode: str = "off",
+    has_style_reference_image: bool = False,
+) -> str:
     meta = get_task_meta(task_type)
     style_guide = (APP_ROOT / "style_guides" / meta["style_guide"]).read_text(encoding="utf-8")
-    return (
+    prompt = (
         f"Detailed Description: {planner_description}\n"
         f"Style Guidelines: {style_guide}\n"
         f"{meta['content_label']}: {method_text}\n"
         f"{meta['intent_label']}: {caption}\n"
         "Your Output:"
     )
+    _, use_in_stylist = resolve_style_reference_targets(
+        style_reference_mode,
+        has_style_reference_image,
+    )
+    if use_in_stylist:
+        prompt += f"\n{build_style_reference_prompt_summary('stylist')}"
+    return prompt
 
 
 def export_prompt_markdown(record: dict[str, Any]) -> str:
@@ -665,6 +704,7 @@ def export_prompt_markdown(record: dict[str, Any]) -> str:
         f"- Updated: {record.get('updated_at', '')}",
         f"- Task Type: {task_type}",
         f"- {meta['intent_label']}: {record.get('caption', '')}",
+        f"- Style Reference Mode: {record.get('style_reference_mode', 'off')}",
         "",
         f"## {meta['content_label']}",
         "",
@@ -752,7 +792,28 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
             runtime_clients=text_runtime_clients,
             fallback=12000,
         )
-        planner_prompt = planner_user_prompt(payload.method_text, payload.caption, payload.task_type)
+        style_reference_mode = normalize_style_reference_mode(payload.style_reference_mode)
+        style_reference_image_base64 = normalize_style_reference_image(
+            payload.style_reference_image_base64
+        )
+        has_style_reference_image = bool(style_reference_image_base64)
+        planner_prompt = planner_user_prompt(
+            payload.method_text,
+            payload.caption,
+            payload.task_type,
+            style_reference_mode=style_reference_mode,
+            has_style_reference_image=has_style_reference_image,
+        )
+        shared_data = {
+            "content": payload.method_text,
+            "visual_intent": payload.caption,
+            "top10_references": [],
+            "retrieved_examples": [],
+            "style_reference_mode": style_reference_mode,
+            "style_reference_image_base64": style_reference_image_base64,
+            "style_reference_image_media_type": payload.style_reference_image_media_type,
+            "text_max_output_tokens": max_output_tokens,
+        }
 
         async def emit_partial(field: str, event: Any):
             if not progress_callback:
@@ -767,31 +828,11 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
         if progress_callback:
             progress_callback({"type": "prompt_stage", "stage": "planner", "status": "running"})
 
-        if payload.text_provider == "openai_compatible":
-            response_list = await generation_utils.call_evolink_text_with_retry_async(
-                model_name=payload.text_model,
-                contents=[{"type": "text", "text": planner_prompt}],
-                config={
-                    "system_prompt": planner.system_prompt,
-                    "temperature": exp_config.temperature,
-                    "max_output_tokens": max_output_tokens,
-                },
-                max_attempts=3,
-                retry_delay=3,
-                runtime_clients=text_runtime_clients,
-                progress_callback=lambda event: emit_partial("planner_output", event),
-            )
-        else:
-            data = {
-                "content": payload.method_text,
-                "visual_intent": payload.caption,
-                "top10_references": [],
-                "retrieved_examples": [],
-            }
-            data = await planner.process(data)
-            response_list = [data[target_desc_key(payload.task_type)]]
-
-        planner_output = response_list[0].strip()
+        data = await planner.process(
+            dict(shared_data),
+            progress_callback=lambda event: emit_partial("planner_output", event),
+        )
+        planner_output = data[target_desc_key(payload.task_type)].strip()
         if not planner_output or planner_output == "Error":
             raise RuntimeError("Planner 文本生成失败")
         planner_system = planner.system_prompt
@@ -799,34 +840,23 @@ async def run_prompt_pipeline(payload: "PromptRequest", progress_callback=None) 
             progress_callback({"type": "prompt_output", "field": "planner_output", "value": planner_output})
             progress_callback({"type": "prompt_stage", "stage": "planner", "status": "completed"})
 
-        stylist_prompt = stylist_user_prompt(planner_output, payload.method_text, payload.caption, payload.task_type)
+        stylist_prompt = stylist_user_prompt(
+            planner_output,
+            payload.method_text,
+            payload.caption,
+            payload.task_type,
+            style_reference_mode=style_reference_mode,
+            has_style_reference_image=has_style_reference_image,
+        )
         if progress_callback:
             progress_callback({"type": "prompt_stage", "stage": "stylist", "status": "running"})
 
-        if payload.text_provider == "openai_compatible":
-            response_list = await generation_utils.call_evolink_text_with_retry_async(
-                model_name=payload.text_model,
-                contents=[{"type": "text", "text": stylist_prompt}],
-                config={
-                    "system_prompt": stylist.system_prompt,
-                    "temperature": exp_config.temperature,
-                    "max_output_tokens": max_output_tokens,
-                },
-                max_attempts=3,
-                retry_delay=3,
-                runtime_clients=text_runtime_clients,
-                progress_callback=lambda event: emit_partial("stylist_output", event),
-            )
-        else:
-            data = {
-                "content": payload.method_text,
-                "visual_intent": payload.caption,
-                target_desc_key(payload.task_type): planner_output,
-            }
-            data = await stylist.process(data)
-            response_list = [data[target_stylist_key(payload.task_type)]]
-
-        stylist_output = response_list[0].strip()
+        data[target_desc_key(payload.task_type)] = planner_output
+        data = await stylist.process(
+            data,
+            progress_callback=lambda event: emit_partial("stylist_output", event),
+        )
+        stylist_output = data[target_stylist_key(payload.task_type)].strip()
         if not stylist_output or stylist_output == "Error":
             raise RuntimeError("Stylist 文本生成失败")
         stylist_system = stylist.system_prompt
@@ -1076,6 +1106,10 @@ class PromptRequest(BaseModel):
     image_api_key: str = ""
     image_base_url: str = ""
     image_model: str = "gemini-3.0-pro-image-landscape"
+    style_reference_mode: str = "off"
+    style_reference_image_base64: str = ""
+    style_reference_image_media_type: str = "image/png"
+    style_reference_image_filename: str = ""
 
 
 class BatchRequest(PromptRequest):
@@ -1114,7 +1148,7 @@ async def on_shutdown():
                 pass
 
 
-INDEX_HTML = """
+INDEX_HTML = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1136,6 +1170,8 @@ INDEX_HTML = """
     .muted{color:#6b665d;font-size:14px}
     .sections button{margin:4px 6px 4px 0}
     .img{width:100%;border-radius:12px;border:1px solid #ddd}
+    .style-reference-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .style-reference-preview{max-width:320px;display:none}
     .history-item{border-top:1px solid #eee;padding:10px 0}
     pre{white-space:pre-wrap;word-break:break-word;background:#f7f6f2;border-radius:12px;padding:12px}
     .toggle{display:flex;align-items:center;gap:8px;margin:8px 0 14px}
@@ -1211,6 +1247,19 @@ INDEX_HTML = """
         <textarea id="methodText" placeholder="方法内容 / 某一章某一节"></textarea>
         <label id="intentLabel">图题 / 图注</label>
         <textarea id="caption" placeholder="图题 / 图注"></textarea>
+        <label>风格参考模式</label>
+        <select id="styleReferenceMode">
+          <option value="off">关闭</option>
+          <option value="stylist_only" selected>仅 Stylist</option>
+          <option value="planner_and_stylist">Planner + Stylist</option>
+        </select>
+        <label>风格参考图</label>
+        <input id="styleReferenceImageInput" type="file" accept="image/png,image/jpeg,image/jpg" onchange="onStyleReferenceImageSelected(event)" />
+        <div class="style-reference-toolbar">
+          <button id="clearStyleReferenceBtn" class="secondary" type="button" style="display:none" onclick="clearStyleReferenceImage()">清空参考图</button>
+          <span id="styleReferenceStatus" class="muted">未选择参考图</span>
+        </div>
+        <img id="styleReferencePreview" class="img style-reference-preview" alt="style reference preview" />
         <div class="row">
           <button id="generatePromptsBtn" onclick="generatePrompts()">生成 Planner + Stylist 提示词</button>
           <button class="secondary" onclick="saveDefaults()">保存为默认配置</button>
@@ -1289,6 +1338,9 @@ let sectionContentMap = {};
 let currentEventSource = null;
 let currentCriticCandidateId = null;
 let candidateCodeMap = {};
+let styleReferenceImageBase64 = '';
+let styleReferenceImageMediaType = 'image/png';
+let styleReferenceImageFilename = '';
 
 function getTaskMeta() {
   const taskType = document.getElementById('taskType')?.value || 'diagram';
@@ -1314,8 +1366,8 @@ function getTaskMeta() {
   };
 }
 
-function payloadBase() {
-  return {
+function payloadBase(includeStyleReference = false) {
+  const payload = {
     title: document.getElementById('title').value,
     task_type: document.getElementById('taskType').value,
     caption: document.getElementById('caption').value,
@@ -1328,7 +1380,73 @@ function payloadBase() {
     image_api_key: document.getElementById('imageApiKey').value,
     image_base_url: document.getElementById('imageBaseUrl').value,
     image_model: document.getElementById('imageModel').value,
+    style_reference_mode: document.getElementById('styleReferenceMode').value || 'stylist_only',
   };
+  if (includeStyleReference && payload.style_reference_mode !== 'off' && styleReferenceImageBase64) {
+    payload.style_reference_image_base64 = styleReferenceImageBase64;
+    payload.style_reference_image_media_type = styleReferenceImageMediaType || 'image/png';
+    payload.style_reference_image_filename = styleReferenceImageFilename || '';
+  }
+  return payload;
+}
+
+function updateStyleReferencePreview() {
+  const preview = document.getElementById('styleReferencePreview');
+  const clearBtn = document.getElementById('clearStyleReferenceBtn');
+  const status = document.getElementById('styleReferenceStatus');
+  if (!preview || !clearBtn || !status) return;
+
+  if (styleReferenceImageBase64) {
+    preview.src = `data:${styleReferenceImageMediaType || 'image/png'};base64,${styleReferenceImageBase64}`;
+    preview.style.display = 'block';
+    clearBtn.style.display = 'inline-block';
+    status.innerText = styleReferenceImageFilename
+      ? `已选择参考图：${styleReferenceImageFilename}`
+      : '已选择参考图';
+    return;
+  }
+
+  preview.src = '';
+  preview.style.display = 'none';
+  clearBtn.style.display = 'none';
+  status.innerText = '未选择参考图';
+}
+
+function clearStyleReferenceImage() {
+  styleReferenceImageBase64 = '';
+  styleReferenceImageMediaType = 'image/png';
+  styleReferenceImageFilename = '';
+  const input = document.getElementById('styleReferenceImageInput');
+  if (input) input.value = '';
+  updateStyleReferencePreview();
+}
+
+function onStyleReferenceImageSelected(event) {
+  const file = event?.target?.files?.[0];
+  if (!file) {
+    clearStyleReferenceImage();
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = String(reader.result || '');
+    const commaIndex = dataUrl.indexOf(',');
+    if (commaIndex < 0) {
+      clearStyleReferenceImage();
+      return;
+    }
+    const header = dataUrl.slice(0, commaIndex);
+    const base64Data = dataUrl.slice(commaIndex + 1);
+    const mediaMatch = header.match(/^data:(.*?);base64$/i);
+    styleReferenceImageBase64 = base64Data;
+    styleReferenceImageMediaType = (mediaMatch && mediaMatch[1]) ? mediaMatch[1] : (file.type || 'image/png');
+    styleReferenceImageFilename = file.name || '';
+    updateStyleReferencePreview();
+  };
+  reader.onerror = () => {
+    clearStyleReferenceImage();
+  };
+  reader.readAsDataURL(file);
 }
 
 function setBusy(buttonId, busy, busyText, idleText) {
@@ -1533,6 +1651,8 @@ async function loadDefaults() {
   }
   document.getElementById('textModel').value = data.text_model || '';
   document.getElementById('imageModel').value = data.image_model || '';
+  document.getElementById('styleReferenceMode').value = data.style_reference_mode || 'stylist_only';
+  clearStyleReferenceImage();
   refreshTaskMode();
   refreshMarkdownPreviews();
   if (data.paper_file_path) {
@@ -1601,7 +1721,7 @@ function copySectionById(sectionId) {
 async function generatePrompts() {
   setBusy('generatePromptsBtn', true, '正在生成提示词...', '生成 Planner + Stylist 提示词');
   try {
-    const data = await api('/studio/api/prompts', {method:'POST', body: JSON.stringify(payloadBase())});
+    const data = await api('/studio/api/prompts', {method:'POST', body: JSON.stringify(payloadBase(true))});
     currentJobId = data.job_id;
     currentRecordId = data.record_id;
     document.getElementById('jobStatus').innerText = 'planner running...';
@@ -1879,11 +1999,13 @@ async function archiveHistory(recordId) {
 async function loadHistory(recordId) {
   const data = await api(`/studio/api/history/${recordId}`);
   currentRecordId = recordId;
+  clearStyleReferenceImage();
   document.getElementById('taskType').value = data.task_type || 'diagram';
   refreshTaskMode();
   document.getElementById('title').value = data.title || '';
   document.getElementById('caption').value = data.caption || '';
   document.getElementById('methodText').value = data.method_text || '';
+  document.getElementById('styleReferenceMode').value = data.style_reference_mode || 'stylist_only';
   document.getElementById('plannerOutput').value = data.planner_output || '';
   document.getElementById('stylistOutput').value = data.stylist_output || '';
   const latestCritic = (data.critic_runs || []).at(-1);
@@ -1924,6 +2046,7 @@ function downloadMarkdown() {
 window.onload = async () => {
   await loadDefaults();
   await renderHistory();
+  updateStyleReferencePreview();
 };
 </script>
 </body>
@@ -1980,6 +2103,14 @@ async def generate_prompts(req: PromptRequest):
 
     def worker():
         async def runner():
+            style_reference_mode = normalize_style_reference_mode(req.style_reference_mode)
+            style_reference_image_base64 = normalize_style_reference_image(
+                req.style_reference_image_base64
+            )
+            has_style_reference_image = bool(style_reference_image_base64)
+            sanitized_config = strip_style_reference_fields(req.model_dump())
+            sanitized_config["style_reference_mode"] = style_reference_mode
+            sanitized_config["has_style_reference_image"] = has_style_reference_image
             record = {
                 "id": record_id,
                 "created_at": now_str(),
@@ -1988,13 +2119,21 @@ async def generate_prompts(req: PromptRequest):
                 "task_type": req.task_type,
                 "caption": req.caption,
                 "method_text": req.method_text,
-                "planner_user_prompt": planner_user_prompt(req.method_text, req.caption, req.task_type),
+                "style_reference_mode": style_reference_mode,
+                "has_style_reference_image": has_style_reference_image,
+                "planner_user_prompt": planner_user_prompt(
+                    req.method_text,
+                    req.caption,
+                    req.task_type,
+                    style_reference_mode=style_reference_mode,
+                    has_style_reference_image=has_style_reference_image,
+                ),
                 "planner_output": "",
                 "stylist_user_prompt": "",
                 "stylist_output": "",
                 "candidates": [],
                 "critic_runs": [],
-                "config": req.model_dump(),
+                "config": sanitized_config,
             }
             save_record(record)
 
@@ -2018,6 +2157,8 @@ async def generate_prompts(req: PromptRequest):
                                     req.method_text,
                                     req.caption,
                                     req.task_type,
+                                    style_reference_mode=style_reference_mode,
+                                    has_style_reference_image=has_style_reference_image,
                                 ),
                             },
                         )
@@ -2350,6 +2491,9 @@ async def save_defaults(req: dict[str, Any]):
     ui_defaults["task_type"] = req.get("task_type", "diagram")
     ui_defaults["text_provider"] = req.get("text_provider", "openai_compatible")
     ui_defaults["image_provider"] = req.get("image_provider", "openai_compatible")
+    ui_defaults["style_reference_mode"] = normalize_style_reference_mode(
+        req.get("style_reference_mode", "stylist_only")
+    )
     ui_defaults["paper_file_path"] = req.get("paper_file_path", "")
     openai_cfg = config_data.setdefault("openai_compatible", {})
     google_cfg = config_data.setdefault("google_compatible", {})

@@ -17,13 +17,15 @@ Stylist Agent - 根据风格指南优化图表描述。
 """
 
 import json
-import os
-from pathlib import Path
-from typing import Dict, Any, Optional
-import base64, io, asyncio
-from PIL import Image
+from typing import Any, Callable, Dict
 
 from utils import generation_utils
+from utils.style_reference import (
+    build_style_reference_contents,
+    normalize_style_reference_image,
+    normalize_style_reference_mode,
+    resolve_style_reference_targets,
+)
 from .base_agent import BaseAgent
 
 
@@ -47,7 +49,11 @@ class StylistAgent(BaseAgent):
                 "context_labels": ["Methodology Section", "Diagram Caption"],
             }
 
-    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def process(
+        self,
+        data: Dict[str, Any],
+        progress_callback: Callable[[Any], Any] | None = None,
+    ) -> Dict[str, Any]:
         cfg = self.task_config
         task_name = cfg["task_name"]
 
@@ -66,15 +72,41 @@ class StylistAgent(BaseAgent):
         user_prompt += f"{cfg['context_labels'][0]}: {raw_content}\n"
         user_prompt += f"{cfg['context_labels'][1]}: {data['visual_intent']}\nYour Output:"
 
-        content_list = [{"type": "text", "text": user_prompt}]
+        content_list = []
+
+        style_reference_mode = normalize_style_reference_mode(data.get("style_reference_mode"))
+        style_reference_image_base64 = normalize_style_reference_image(
+            data.get("style_reference_image_base64")
+        )
+        style_reference_image_media_type = data.get(
+            "style_reference_image_media_type", "image/png"
+        )
+        _, use_in_stylist = resolve_style_reference_targets(
+            style_reference_mode,
+            has_image=bool(style_reference_image_base64),
+        )
+        if use_in_stylist:
+            content_list.extend(
+                build_style_reference_contents(
+                    style_reference_image_base64,
+                    media_type=style_reference_image_media_type,
+                    consumer="stylist",
+                )
+            )
+
+        content_list.append({"type": "text", "text": user_prompt})
 
         # 根据 provider 路由 API 调用
-        max_output_tokens = generation_utils.resolve_text_max_output_tokens(
-            model_name=self.model_name,
-            provider=self.exp_config.text_provider,
-            runtime_clients=self.exp_config.text_runtime_clients,
-            fallback=50000,
-        )
+        max_output_tokens_override = data.get("text_max_output_tokens")
+        if isinstance(max_output_tokens_override, int) and max_output_tokens_override > 0:
+            max_output_tokens = max_output_tokens_override
+        else:
+            max_output_tokens = generation_utils.resolve_text_max_output_tokens(
+                model_name=self.model_name,
+                provider=self.exp_config.text_provider,
+                runtime_clients=self.exp_config.text_runtime_clients,
+                fallback=50000,
+            )
         if self.exp_config.text_provider == "openai_compatible":
             response_list = await generation_utils.call_evolink_text_with_retry_async(
                 model_name=self.model_name,
@@ -87,6 +119,7 @@ class StylistAgent(BaseAgent):
                 max_attempts=5,
                 retry_delay=5,
                 runtime_clients=self.exp_config.text_runtime_clients,
+                progress_callback=progress_callback,
             )
         else:
             from google.genai import types
